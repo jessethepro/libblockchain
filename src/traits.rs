@@ -51,27 +51,25 @@ pub trait BlockHeaderHasher {
 /// - parent_hash is all zeros (no predecessor)
 /// - Often used to establish initial state or configuration
 pub trait GenesisBlock {
-    /// Create a new genesis block with the given data and signature.
+    /// Create a new genesis block with the given data.
     ///
     /// # Arguments
     ///
     /// * `hasher` - The hasher to use for computing the block hash
     /// * `block_data` - Application-specific data for the genesis block
-    /// * `signature` - Digital signature for the genesis block
-    fn new_genesis<H: BlockHeaderHasher>(hasher: &H, block_data: Vec<u8>, signature: Vec<u8>) -> Self;
+    fn new_genesis<H: BlockHeaderHasher>(hasher: &H, block_data: Vec<u8>) -> Self;
 }
 
 /// Trait for creating a regular (non-genesis) block.
 ///
 /// Regular blocks link to a parent block via parent_hash.
 pub trait RegularBlock {
-    /// Create a new block with the given parent hash, data, and signature.
+    /// Create a new block with the given parent hash and data.
     ///
     /// # Arguments
     ///
     /// * `hasher` - The hasher to use for computing the block hash
     /// * `parent_hash` - Hash of the previous block in the chain
     /// * `block_data` - Application-specific data for this block
-    /// * `signature` - Digital signature for this block
-    fn new_block<H: BlockHeaderHasher>(hasher: &H, parent_hash: [u8; 32], block_data: Vec<u8>, signature: Vec<u8>) -> Self;
+    fn new_block<H: BlockHeaderHasher>(hasher: &H, parent_hash: [u8; 32], block_data: Vec<u8>) -> Self;
 }

@@ -62,9 +62,6 @@ pub struct Block {
 
     /// Application-specific block data (opaque to this library)
     pub block_data: Vec<u8>,
-    
-    /// Producer digital signature of this block
-    pub signature: Vec<u8>,
 }
 
 impl Block {
@@ -73,13 +70,11 @@ impl Block {
         block_header: BlockHeader,
         block_hash: [u8; 32],
         block_data: Vec<u8>,
-        signature: Vec<u8>,
     ) -> Self {
         Self {
             block_header,
             block_hash,
             block_data,
-            signature,
         }
     }
     
@@ -99,13 +94,12 @@ impl Block {
 }
 
 impl GenesisBlock for Block {
-    fn new_genesis<H: crate::traits::BlockHeaderHasher>(hasher: &H, block_data: Vec<u8>, signature: Vec<u8>) -> Self {
+    fn new_genesis<H: crate::traits::BlockHeaderHasher>(hasher: &H, block_data: Vec<u8>) -> Self {
         let header = BlockHeader::new([0u8; 32]);
         let mut block = Block::new(
             header,
             [0u8; 32],
             block_data,
-            signature,
         );
         let header_hash = block.header_hash(hasher);
         let mut block_hash = [0u8; 32];
@@ -116,13 +110,12 @@ impl GenesisBlock for Block {
 }
 
 impl RegularBlock for Block {
-    fn new_block<H: crate::traits::BlockHeaderHasher>(hasher: &H, parent_hash: [u8; 32], block_data: Vec<u8>, signature: Vec<u8>) -> Self {
+    fn new_block<H: crate::traits::BlockHeaderHasher>(hasher: &H, parent_hash: [u8; 32], block_data: Vec<u8>) -> Self {
         let header = BlockHeader::new(parent_hash);
         let mut block = Block::new(
             header,
             [0u8; 32],
             block_data,
-            signature,
         );
         let header_hash = block.header_hash(hasher);
         let mut block_hash = [0u8; 32];

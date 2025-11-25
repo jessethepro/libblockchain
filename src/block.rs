@@ -124,3 +124,113 @@ impl RegularBlock for Block {
         block
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::BlockHeaderHasher;
+
+    // Simple test hasher for testing
+    struct TestHasher;
+    
+    impl BlockHeaderHasher for TestHasher {
+        fn hash(&self, data: &[u8]) -> Vec<u8> {
+            // Simple hash: just return first 32 bytes or pad with zeros
+            let mut result = vec![0u8; 32];
+            let len = data.len().min(32);
+            result[..len].copy_from_slice(&data[..len]);
+            result
+        }
+        
+        fn hash_size(&self) -> usize {
+            32
+        }
+    }
+
+    #[test]
+    fn test_block_header_creation() {
+        let parent_hash = [1u8; 32];
+        let header = BlockHeader::new(parent_hash);
+        
+        assert_eq!(header.version, BLOCK_VERSION);
+        assert_eq!(header.parent_hash, parent_hash);
+        assert!(header.timestamp > 0);
+        assert_eq!(header.block_uid.len(), 16); // UUID is 16 bytes
+    }
+
+    #[test]
+    fn test_genesis_block_has_zero_parent_hash() {
+        let hasher = TestHasher;
+        let block_data = vec![1, 2, 3, 4];
+        let genesis = Block::new_genesis(&hasher, block_data.clone());
+        
+        assert_eq!(genesis.block_header.parent_hash, [0u8; 32]);
+        assert_eq!(genesis.block_data, block_data);
+        assert_ne!(genesis.block_hash, [0u8; 32]); // Hash should be computed
+    }
+
+    #[test]
+    fn test_regular_block_creation() {
+        let hasher = TestHasher;
+        let parent_hash = [5u8; 32];
+        let block_data = vec![10, 20, 30];
+        
+        let block = Block::new_block(&hasher, parent_hash, block_data.clone());
+        
+        assert_eq!(block.block_header.parent_hash, parent_hash);
+        assert_eq!(block.block_data, block_data);
+        assert_ne!(block.block_hash, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_header_bytes_serialization() {
+        let header = BlockHeader::new([42u8; 32]);
+        let block = Block::new(header.clone(), [0u8; 32], vec![]);
+        
+        let bytes = block.header_bytes();
+        
+        // Should contain: uid(16) + version(4) + parent_hash(32) + timestamp(8) + nonce(8) = 68 bytes
+        assert_eq!(bytes.len(), 68);
+        
+        // Verify parent_hash is in the serialized bytes
+        assert!(bytes.windows(32).any(|window| window == &[42u8; 32]));
+    }
+
+    #[test]
+    fn test_block_hash_computation() {
+        let hasher = TestHasher;
+        let block_data = vec![100, 101, 102];
+        let block = Block::new_genesis(&hasher, block_data);
+        
+        let computed_hash = block.header_hash(&hasher);
+        
+        assert_eq!(computed_hash.len(), 32);
+        assert_eq!(block.block_hash[..], computed_hash[..32]);
+    }
+
+    #[test]
+    fn test_different_blocks_have_different_uids() {
+        let header1 = BlockHeader::new([0u8; 32]);
+        let header2 = BlockHeader::new([0u8; 32]);
+        
+        assert_ne!(header1.block_uid, header2.block_uid);
+    }
+
+    #[test]
+    fn test_block_chain_linking() {
+        let hasher = TestHasher;
+        
+        // Create genesis block
+        let genesis = Block::new_genesis(&hasher, vec![1, 2, 3]);
+        
+        // Create next block using genesis hash
+        let block2 = Block::new_block(&hasher, genesis.block_hash, vec![4, 5, 6]);
+        
+        assert_eq!(block2.block_header.parent_hash, genesis.block_hash);
+        
+        // Create third block
+        let block3 = Block::new_block(&hasher, block2.block_hash, vec![7, 8, 9]);
+        
+        assert_eq!(block3.block_header.parent_hash, block2.block_hash);
+    }
+}

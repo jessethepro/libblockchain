@@ -3,20 +3,15 @@
 //! These tests demonstrate how consumers would use the library to create
 //! and manage blockchain blocks.
 
-use libblockchain::{Block, BlockHeaderHasher, GenesisBlock, RegularBlock};
+use libblockchain::{Block, BlockHeaderHasher, GenesisBlock, RegularBlock, CertificateTools};
 
-/// Example SHA-256-like hasher implementation
-struct Sha256Hasher;
+/// SHA-256 hasher implementation using CertificateTools
+struct CertToolsHasher;
 
-impl BlockHeaderHasher for Sha256Hasher {
+impl BlockHeaderHasher for CertToolsHasher {
     fn hash(&self, data: &[u8]) -> Vec<u8> {
-        // In real usage, this would use a proper crypto library like sha2
-        // For testing, we'll create a deterministic "hash"
-        let mut result = vec![0u8; 32];
-        for (i, byte) in data.iter().enumerate() {
-            result[i % 32] ^= byte;
-        }
-        result
+        CertificateTools::hash_sha256(data)
+            .expect("SHA-256 hashing failed")
     }
 
     fn hash_size(&self) -> usize {
@@ -26,7 +21,7 @@ impl BlockHeaderHasher for Sha256Hasher {
 
 #[test]
 fn test_create_simple_blockchain() {
-    let hasher = Sha256Hasher;
+    let hasher = CertToolsHasher;
 
     // Create genesis block
     let genesis = Block::new_genesis(&hasher, b"Genesis block data".to_vec());
@@ -47,7 +42,7 @@ fn test_create_simple_blockchain() {
 
 #[test]
 fn test_genesis_block_properties() {
-    let hasher = Sha256Hasher;
+    let hasher = CertToolsHasher;
     let genesis_data = b"Initial state data".to_vec();
     
     let genesis = Block::new_genesis(&hasher, genesis_data.clone());
@@ -67,7 +62,7 @@ fn test_genesis_block_properties() {
 
 #[test]
 fn test_block_with_custom_data() {
-    let hasher = Sha256Hasher;
+    let hasher = CertToolsHasher;
     
     // Simulate storing JSON data in blocks
     let json_data = br#"{"transaction": "transfer", "amount": 100}"#.to_vec();
@@ -83,7 +78,7 @@ fn test_block_with_custom_data() {
 
 #[test]
 fn test_hash_consistency() {
-    let hasher = Sha256Hasher;
+    let hasher = CertToolsHasher;
     
     let block = Block::new_genesis(&hasher, vec![1, 2, 3]);
     
@@ -114,7 +109,7 @@ fn test_multiple_hashers() {
         }
     }
     
-    let hasher1 = Sha256Hasher;
+    let hasher1 = CertToolsHasher;
     let hasher2 = AlternateHasher;
     
     let block1 = Block::new_genesis(&hasher1, vec![10, 20, 30]);
@@ -126,7 +121,7 @@ fn test_multiple_hashers() {
 
 #[test]
 fn test_long_blockchain() {
-    let hasher = Sha256Hasher;
+    let hasher = CertToolsHasher;
     
     let mut blocks = Vec::new();
     

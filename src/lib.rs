@@ -1,6 +1,6 @@
 pub mod block;
 
-pub use block::{Block, BlockHeader, BlockHeaderHasher, GenesisBlock, RegularBlock, BLOCK_VERSION};
+pub use block::{Block, BlockHeader, BLOCK_VERSION};
 
 // Re-export uuid for convenience
 pub use uuid;

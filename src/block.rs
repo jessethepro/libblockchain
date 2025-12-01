@@ -4,75 +4,7 @@
 //! through cryptographic hashing and linking to previous blocks.
 
 pub const BLOCK_VERSION: u32 = 1;
-
-/// Trait for hashing operations in the blockchain.
-///
-/// Implement this trait to use custom hashing algorithms (SHA-256, SHA3, BLAKE3, etc.)
-/// with the blockchain library.
-///
-/// # Examples
-///
-/// ```ignore
-/// use libblockchain::CertificateTools;
-///
-/// struct CertToolsHasher;
-///
-/// impl BlockHeaderHasher for CertToolsHasher {
-///     fn hash(&self, data: &[u8]) -> Vec<u8> {
-///         CertificateTools::hash_sha256(data)
-///     }
-///
-///     fn hash_size(&self) -> usize {
-///         32 // SHA-256 produces 32-byte hashes
-///     }
-/// }
-/// ```
-pub trait BlockHeaderHasher {
-    /// Compute the hash of the given data.
-    ///
-    /// # Arguments
-    ///
-    /// * `data` - The data to hash
-    ///
-    /// # Returns
-    ///
-    /// A vector containing the hash bytes. The length should match `hash_size()`.
-    fn hash(&self, data: &[u8]) -> Vec<u8>;
-
-    /// Return the size of hashes produced by this hasher in bytes.
-    ///
-    /// This allows the library to validate hash lengths and allocate appropriately.
-    fn hash_size(&self) -> usize;
-}
-
-/// Trait for creating a genesis block (the first block in a blockchain).
-///
-/// Genesis blocks have special properties:
-/// - parent_hash is all zeros (no predecessor)
-/// - Often used to establish initial state or configuration
-pub trait GenesisBlock {
-    /// Create a new genesis block with the given data.
-    ///
-    /// # Arguments
-    ///
-    /// * `hasher` - The hasher to use for computing the block hash
-    /// * `block_data` - Application-specific data for the genesis block
-    fn new_genesis<H: BlockHeaderHasher>(hasher: &H, block_data: Vec<u8>) -> Self;
-}
-
-/// Trait for creating a regular (non-genesis) block.
-///
-/// Regular blocks link to a parent block via parent_hash.
-pub trait RegularBlock {
-    /// Create a new block with the given parent hash and data.
-    ///
-    /// # Arguments
-    ///
-    /// * `hasher` - The hasher to use for computing the block hash
-    /// * `parent_hash` - Hash of the previous block in the chain
-    /// * `block_data` - Application-specific data for this block
-    fn new_block<H: BlockHeaderHasher>(hasher: &H, parent_hash: [u8; 32], block_data: Vec<u8>) -> Self;
-}
+pub use libcertcrypto::CertificateTools;
 
 /// Core header for a block in a blockchain.
 /// This struct contains only cryptographically relevant data for hash calculations.
@@ -96,25 +28,50 @@ pub struct BlockHeader {
 }
 
 impl BlockHeader {
-    /// Create a minimal new header convenience constructor.
+    /// Create a fully constructed new header convenience constructor.
     /// Note: block_height is handled separately as database metadata.
     pub fn new(
         parent_hash: [u8; 32],
-    ) -> Self {
+    ) -> (Self, [u8; 32]) {
         use std::time::{SystemTime, UNIX_EPOCH};
         use uuid::Uuid;
         use rand::Rng;
         
-        Self {
-            block_uid: *Uuid::new_v4().as_bytes(),
-            version: BLOCK_VERSION,
+        let block_uid = Uuid::new_v4().as_bytes().to_owned();
+        let version = BLOCK_VERSION;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+        let nonce: u64 = rand::rng().random();
+        let header = Self {
+            block_uid,
+            version,
             parent_hash,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            nonce: rand::rng().random::<u64>(),
-        }
+            timestamp,
+            nonce,
+        };
+        let block_hash = header.generate_block_hash();
+        (header, block_hash)
+    }
+
+    pub fn get_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&self.block_uid);
+        bytes.extend_from_slice(&self.version.to_le_bytes());
+        bytes.extend_from_slice(&self.parent_hash);
+        bytes.extend_from_slice(&self.timestamp.to_le_bytes());
+        bytes.extend_from_slice(&self.nonce.to_le_bytes());
+        bytes
+    }
+
+    pub fn generate_block_hash(&self) -> [u8; 32] {
+        let header_bytes = self.get_bytes();
+        let hash_vec = CertificateTools::hash_sha256(&header_bytes)
+            .expect("SHA-256 hashing failed");
+        let mut block_hash = [0u8; 32];
+        block_hash.copy_from_slice(&hash_vec[..32]);
+        block_hash
     }
 }
 
@@ -132,64 +89,29 @@ pub struct Block {
 }
 
 impl Block {
-    /// Block default constructor
-    pub fn new(
-        block_header: BlockHeader,
-        block_hash: [u8; 32],
+    /// Regular constructor for Block
+    pub fn new_regular_block(
+        parent_hash: [u8; 32],
         block_data: Vec<u8>,
     ) -> Self {
+        let (header, block_hash) = BlockHeader::new(parent_hash);
         Self {
-            block_header,
-            block_hash,
-            block_data,
+            block_header: header,
+            block_hash: block_hash,
+            block_data: block_data,
         }
     }
-    
-    pub fn header_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&self.block_header.block_uid);
-        bytes.extend_from_slice(&self.block_header.version.to_le_bytes());
-        bytes.extend_from_slice(&self.block_header.parent_hash);
-        bytes.extend_from_slice(&self.block_header.timestamp.to_le_bytes());
-        bytes.extend_from_slice(&self.block_header.nonce.to_le_bytes());
-        bytes
-    }
-    
-    pub fn header_hash<H: BlockHeaderHasher>(&self, hasher: &H) -> Vec<u8> {
-        let header_bytes = self.header_bytes();
-        hasher.hash(&header_bytes)
-    }
-}
+    /// Genesis block constructor
+    pub fn new_genesis_block(
+        block_data: Vec<u8>,
+    ) -> Self {
+        let (header, block_hash) = BlockHeader::new([0u8; 32]);
+        Self {
+            block_header: header,
+            block_hash: block_hash,
+            block_data: block_data,
 
-impl GenesisBlock for Block {
-    fn new_genesis<H: BlockHeaderHasher>(hasher: &H, block_data: Vec<u8>) -> Self {
-        let header = BlockHeader::new([0u8; 32]);
-        let mut block = Block::new(
-            header,
-            [0u8; 32],
-            block_data,
-        );
-        let header_hash = block.header_hash(hasher);
-        let mut block_hash = [0u8; 32];
-        block_hash.copy_from_slice(&header_hash[..32.min(header_hash.len())]);
-        block.block_hash = block_hash;
-        block
-    }
-}
-
-impl RegularBlock for Block {
-    fn new_block<H: BlockHeaderHasher>(hasher: &H, parent_hash: [u8; 32], block_data: Vec<u8>) -> Self {
-        let header = BlockHeader::new(parent_hash);
-        let mut block = Block::new(
-            header,
-            [0u8; 32],
-            block_data,
-        );
-        let header_hash = block.header_hash(hasher);
-        let mut block_hash = [0u8; 32];
-        block_hash.copy_from_slice(&header_hash[..32.min(header_hash.len())]);
-        block.block_hash = block_hash;
-        block
+        }
     }
 }
 
@@ -197,39 +119,22 @@ impl RegularBlock for Block {
 mod tests {
     use super::*;
 
-    // Simple test hasher for testing
-    struct TestHasher;
-    
-    impl BlockHeaderHasher for TestHasher {
-        fn hash(&self, data: &[u8]) -> Vec<u8> {
-            // Simple hash: just return first 32 bytes or pad with zeros
-            let mut result = vec![0u8; 32];
-            let len = data.len().min(32);
-            result[..len].copy_from_slice(&data[..len]);
-            result
-        }
-        
-        fn hash_size(&self) -> usize {
-            32
-        }
-    }
-
     #[test]
     fn test_block_header_creation() {
         let parent_hash = [1u8; 32];
-        let header = BlockHeader::new(parent_hash);
+        let (header, block_hash) = BlockHeader::new(parent_hash);
         
         assert_eq!(header.version, BLOCK_VERSION);
         assert_eq!(header.parent_hash, parent_hash);
         assert!(header.timestamp > 0);
         assert_eq!(header.block_uid.len(), 16); // UUID is 16 bytes
+        assert_ne!(block_hash, [0u8; 32]); // Hash should be generated
     }
 
     #[test]
     fn test_genesis_block_has_zero_parent_hash() {
-        let hasher = TestHasher;
         let block_data = vec![1, 2, 3, 4];
-        let genesis = Block::new_genesis(&hasher, block_data.clone());
+        let genesis = Block::new_genesis_block(block_data.clone());
         
         assert_eq!(genesis.block_header.parent_hash, [0u8; 32]);
         assert_eq!(genesis.block_data, block_data);
@@ -238,11 +143,10 @@ mod tests {
 
     #[test]
     fn test_regular_block_creation() {
-        let hasher = TestHasher;
         let parent_hash = [5u8; 32];
         let block_data = vec![10, 20, 30];
         
-        let block = Block::new_block(&hasher, parent_hash, block_data.clone());
+        let block = Block::new_regular_block(parent_hash, block_data.clone());
         
         assert_eq!(block.block_header.parent_hash, parent_hash);
         assert_eq!(block.block_data, block_data);
@@ -251,10 +155,9 @@ mod tests {
 
     #[test]
     fn test_header_bytes_serialization() {
-        let header = BlockHeader::new([42u8; 32]);
-        let block = Block::new(header.clone(), [0u8; 32], vec![]);
+        let (header, _) = BlockHeader::new([42u8; 32]);
         
-        let bytes = block.header_bytes();
+        let bytes = header.get_bytes();
         
         // Should contain: uid(16) + version(4) + parent_hash(32) + timestamp(8) + nonce(8) = 68 bytes
         assert_eq!(bytes.len(), 68);
@@ -265,38 +168,35 @@ mod tests {
 
     #[test]
     fn test_block_hash_computation() {
-        let hasher = TestHasher;
         let block_data = vec![100, 101, 102];
-        let block = Block::new_genesis(&hasher, block_data);
+        let block = Block::new_genesis_block(block_data);
         
-        let computed_hash = block.header_hash(&hasher);
+        // Recompute hash to verify it matches
+        let computed_hash = block.block_header.generate_block_hash();
         
-        assert_eq!(computed_hash.len(), 32);
-        assert_eq!(block.block_hash[..], computed_hash[..32]);
+        assert_eq!(block.block_hash, computed_hash);
     }
 
     #[test]
     fn test_different_blocks_have_different_uids() {
-        let header1 = BlockHeader::new([0u8; 32]);
-        let header2 = BlockHeader::new([0u8; 32]);
+        let (header1, _) = BlockHeader::new([0u8; 32]);
+        let (header2, _) = BlockHeader::new([0u8; 32]);
         
         assert_ne!(header1.block_uid, header2.block_uid);
     }
 
     #[test]
     fn test_block_chain_linking() {
-        let hasher = TestHasher;
-        
         // Create genesis block
-        let genesis = Block::new_genesis(&hasher, vec![1, 2, 3]);
+        let genesis = Block::new_genesis_block(vec![1, 2, 3]);
         
         // Create next block using genesis hash
-        let block2 = Block::new_block(&hasher, genesis.block_hash, vec![4, 5, 6]);
+        let block2 = Block::new_regular_block(genesis.block_hash, vec![4, 5, 6]);
         
         assert_eq!(block2.block_header.parent_hash, genesis.block_hash);
         
         // Create third block
-        let block3 = Block::new_block(&hasher, block2.block_hash, vec![7, 8, 9]);
+        let block3 = Block::new_regular_block(block2.block_hash, vec![7, 8, 9]);
         
         assert_eq!(block3.block_header.parent_hash, block2.block_hash);
     }

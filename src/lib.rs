@@ -1,4 +1,5 @@
 pub mod block;
+pub mod blockchain;
 pub mod hybrid_encryption;
 
 // Re-export uuid for convenience

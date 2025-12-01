@@ -1,6 +1,5 @@
 pub mod block;
-
-pub use block::{Block, BlockHeader, BLOCK_VERSION};
+pub mod hybrid_encryption;
 
 // Re-export uuid for convenience
 pub use uuid;

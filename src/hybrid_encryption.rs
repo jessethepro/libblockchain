@@ -1,11 +1,49 @@
 //! Hybrid encryption module combining RSA and AES-GCM
 //!
-//! This module provides secure encryption for large data using:
-//! - RSA (2048/4096) for encrypting symmetric keys
-//! - AES-256-GCM for encrypting actual data
+//! This module provides secure encryption for large data using hybrid cryptography:
+//! - **RSA-OAEP** (2048/4096-bit) for encrypting symmetric keys
+//! - **AES-256-GCM** for encrypting actual data with authenticated encryption
 //!
 //! This approach combines the security of public-key cryptography with
-//! the performance of symmetric encryption.
+//! the performance of symmetric encryption, making it suitable for
+//! encrypting block data of arbitrary size.
+//!
+//! # Security Properties
+//!
+//! - **Confidentiality**: RSA public key encryption + AES-256
+//! - **Authenticity**: AES-GCM authentication tag
+//! - **Integrity**: GCM mode detects tampering
+//! - **Nonce uniqueness**: Random 12-byte nonce per encryption
+//!
+//! # Format
+//!
+//! Encrypted data is stored in [`HybridEncryptedData`] which serializes to:
+//! 1. RSA-encrypted AES key (256 or 512 bytes depending on RSA key size)
+//! 2. AES-GCM nonce (12 bytes)
+//! 3. AES-GCM authentication tag (16 bytes)
+//! 4. AES-GCM ciphertext (variable length)
+//!
+//! # Example
+//!
+//! ```no_run
+//! use libblockchain::hybrid_encryption::{hybrid_encrypt, hybrid_decrypt};
+//! # use openssl::x509::X509;
+//! # use openssl::pkey::PKey;
+//!
+//! # fn example() -> anyhow::Result<()> {
+//! # let cert: X509 = unsafe { std::mem::zeroed() };
+//! # let private_key: PKey<openssl::pkey::Private> = unsafe { std::mem::zeroed() };
+//! let data = b"Secret blockchain data";
+//!
+//! // Encrypt with certificate (contains public key)
+//! let encrypted = hybrid_encrypt(&cert, data)?;
+//!
+//! // Decrypt with private key
+//! let decrypted = hybrid_decrypt(&private_key, &encrypted)?;
+//! assert_eq!(data, &decrypted[..]);
+//! # Ok(())
+//! # }
+//! ```
 
 use anyhow::{anyhow, Result};
 use openssl::pkey::{PKey, Private, Public};
@@ -41,11 +79,11 @@ impl HybridEncryptedData {
     /// Serialize to binary format for storage or transmission
     /// 
     /// Format:
-    /// - [0..2]: Key length as u16 big-endian
-    /// - [2..2+key_len]: Encrypted AES key
-    /// - [2+key_len..2+key_len+12]: Nonce (12 bytes)
-    /// - [2+key_len+12..2+key_len+28]: Tag (16 bytes)
-    /// - [2+key_len+28..]: Ciphertext
+    /// - \[0..2\]: Key length as u16 big-endian
+    /// - \[2..2+key_len\]: Encrypted AES key
+    /// - \[2+key_len..2+key_len+12\]: Nonce (12 bytes)
+    /// - \[2+key_len+12..2+key_len+28\]: Authentication tag (16 bytes)
+    /// - \[2+key_len+28..\]: Encrypted ciphertext
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         

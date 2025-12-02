@@ -120,6 +120,68 @@ impl Block {
             block_data: encrypted_data,
         }
     }
+
+    pub fn serialize_block(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        // Serialize header
+        bytes.extend_from_slice(&self.block_header.get_bytes());
+        // Serialize block hash
+        bytes.extend_from_slice(&self.block_hash);
+        // Serialize block data length
+        let data_len = self.block_data.len() as u32;
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        // Serialize block data
+        bytes.extend_from_slice(&self.block_data);
+        bytes
+    }
+}
+
+pub fn deserialize_block(data: &[u8]) -> Option<Block> {
+    if data.len() < 68 + 32 + 4 {
+        return None; // Not enough data for header, hash, and length
+    }
+
+    // Deserialize header
+    let block_uid = {
+        let mut uid = [0u8; 16];
+        uid.copy_from_slice(&data[0..16]);
+        uid
+    };
+    let version = u32::from_le_bytes(data[16..20].try_into().unwrap());
+    let parent_hash = {
+        let mut phash = [0u8; 32];
+        phash.copy_from_slice(&data[20..52]);
+        phash
+    };
+    let timestamp = u64::from_le_bytes(data[52..60].try_into().unwrap());
+    let nonce = u64::from_le_bytes(data[60..68].try_into().unwrap());
+    let header = BlockHeader {
+        block_uid,
+        version,
+        parent_hash,
+        timestamp,
+        nonce,
+    };
+
+    // Deserialize block hash
+    let mut block_hash = [0u8; 32];
+    block_hash.copy_from_slice(&data[68..100]);
+
+    // Deserialize block data length
+    let data_len = u32::from_le_bytes(data[100..104].try_into().unwrap()) as usize;
+
+    if data.len() < 104 + data_len {
+        return None; // Not enough data for block data
+    }
+
+    // Deserialize block data
+    let block_data = data[104..104 + data_len].to_vec();
+
+    Some(Block {
+        block_header: header,
+        block_hash,
+        block_data,
+    })
 }
 
 #[cfg(test)]

@@ -1,67 +1,177 @@
 //! Blockchain storage and management using SledDB
 //!
 //! This module provides persistent storage for blockchain blocks using Sled,
-//! a high-performance embedded database.
+//! a high-performance embedded database. The blockchain automatically manages
+//! block heights and parent relationships, storing blocks by UUID with a
+//! separate height index for efficient retrieval.
+//!
+//! # Database Structure
+//!
+//! The blockchain uses two SledDB trees:
+//! - `blocks`: Maps block UUID (16 bytes) to serialized Block data
+//! - `height`: Maps block height (u64 as big-endian bytes) to block UUID
+//!
+//! # Concurrency
+//!
+//! The `current_height` field is protected by a `Mutex` to allow safe
+//! concurrent access. This represents the next height to be assigned.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use libblockchain::blockchain::BlockChain;
+//! # use openssl::x509::X509;
+//!
+//! # fn example() -> anyhow::Result<()> {
+//! // Create or open a blockchain
+//! let chain = BlockChain::new("./blockchain_data")?;
+//!
+//! // Insert blocks (height is automatic)
+//! # let cert: X509 = unsafe { std::mem::zeroed() };
+//! chain.insert_block(b"Genesis data".to_vec(), cert.clone())?;
+//! chain.insert_block(b"Block 1 data".to_vec(), cert)?;
+//!
+//! // Retrieve blocks by height
+//! let block = chain.get_block_by_height(0)?.unwrap();
+//!
+//! // Iterate over all blocks
+//! for block in chain.iter() {
+//!     let block = block?;
+//!     println!("Block hash: {:?}", block.block_hash);
+//! }
+//! # Ok(())
+//! # }
+//! ```
 
 use anyhow::{anyhow, Result};
-use sled::Db;
 use std::path::Path;
-use crate::block::Block;
+use std::sync::Mutex;
+use openssl::x509::X509;
+use crate::block::{Block, deserialize_block};
+use crate::db_model::SledDb;
 
-/// SledDB-backed blockchain storage
-pub struct SledDB {
+/// SledDB-backed blockchain storage with automatic height management
+///
+/// This structure maintains a persistent blockchain using SledDB's embedded
+/// key-value store. Blocks are stored by UUID, and a separate index maps
+/// heights to UUIDs for efficient sequential access.
+///
+/// # Thread Safety
+///
+/// The `BlockChain` can be safely shared across threads. The `current_height`
+/// field is protected by a `Mutex` to ensure consistent height assignment.
+pub struct BlockChain {
     /// Sled database instance
-    db: Db,
+    db: sled::Db,
     
-    /// Tree for storing blocks by hash
+    /// Tree for storing blocks by UUID
+    /// Key: block UUID (16 bytes), Value: serialized Block
     blocks: sled::Tree,
     
-    /// Tree for storing block height -> hash mapping
+    /// Tree for storing height -> UUID mapping
+    /// Key: block height (u64 as big-endian bytes), Value: block UUID (16 bytes)
     height_index: sled::Tree,
+
+    /// Next height to be assigned (protected by Mutex for thread safety)
+    /// When inserting a new block, it will be assigned this height,
+    /// then this value is incremented.
+    current_height: Mutex<u64>,
 }
 
-impl SledDB {
-    /// Open or create a new SledDB blockchain database
+impl BlockChain {
+    /// Open or create a new blockchain database
+    /// 
+    /// Opens an existing blockchain at the specified path, or creates a new one
+    /// if it doesn't exist. Automatically recovers the current height from the
+    /// database by scanning the height index.
     /// 
     /// # Arguments
     /// * `path` - Path to the database directory
     /// 
     /// # Returns
-    /// A new SledDB instance
+    /// A `BlockChain` instance with recovered state
+    /// 
+    /// # Errors
+    /// Returns an error if:
+    /// - The database cannot be opened or created
+    /// - The required trees cannot be opened
+    /// - The height index cannot be read
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let db = sled::open(path)
+        let db = SledDb::new(path.as_ref().to_path_buf())
+            .open()
             .map_err(|e| anyhow!("Failed to open SledDB: {}", e))?;
-        
+
+        // blocks tree. Key: block uuid (UUID v4), Value: serialized Block
         let blocks = db.open_tree("blocks")
             .map_err(|e| anyhow!("Failed to open blocks tree: {}", e))?;
-        
-        let height_index = db.open_tree("height_index")
+        // height_index tree. Key: block height (u64 as bytes), Value: block uuid (UUID v4)
+        let height_index = db.open_tree("height")
             .map_err(|e| anyhow!("Failed to open height_index tree: {}", e))?;
+        
+        // Get the largest height value from the height_index tree
+        let max_height = match height_index.last()
+            .map_err(|e| anyhow!("Failed to get last height: {}", e))? {
+            Some((height_bytes, _block_uuid)) => {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&height_bytes);
+                u64::from_be_bytes(bytes)
+            }
+            None => 0 // Empty blockchain, start at height 0
+        };
         
         Ok(Self {
             db,
             blocks,
             height_index,
+            current_height: Mutex::new(max_height),
         })
     }
     
-    /// Store a block in the database
+    /// Insert a new block into the blockchain
+    /// 
+    /// Automatically determines whether to create a genesis block (if current_height == 0)
+    /// or a regular block (linking to the previous block). The height is assigned
+    /// automatically and incremented after insertion.
     /// 
     /// # Arguments
-    /// * `block` - The block to store
-    /// * `height` - The block height (0 for genesis)
-    pub fn insert_block(&self, block: &Block, height: u64) -> Result<()> {
-        // Serialize block (using serde or custom serialization)
-        let block_bytes = self.serialize_block(block)?;
+    /// * `block_data` - The raw data to store in the block (will be encrypted)
+    /// * `app_cert` - X509 certificate used for hybrid encryption of block data
+    /// 
+    /// # Returns
+    /// `Ok(())` on success
+    /// 
+    /// # Errors
+    /// Returns an error if:
+    /// - The parent block cannot be found (for non-genesis blocks)
+    /// - Block serialization fails
+    /// - Database insertion fails
+    /// - Database flush fails
+    pub fn insert_block(&self, block_data: Vec<u8>, app_cert: X509) -> Result<()> {
+        let mut height = self.current_height.lock().unwrap();
         
-        // Store block by hash
-        self.blocks.insert(&block.block_hash, block_bytes)
+        let block = if *height == 0 {
+            Block::new_genesis_block(block_data, app_cert)
+        } else {
+            // Get the previous block (at height - 1)
+            let parent_hash = self.get_block_by_height(*height - 1)?
+                .ok_or_else(|| anyhow!("No parent block found for non-genesis block"))?
+                .block_hash;
+            Block::new_regular_block(parent_hash, block_data, app_cert)
+        };
+        
+        let block_bytes = block.serialize_block();
+        
+        // Store block by UUID
+        self.blocks.insert(&block.block_header.block_uid, block_bytes)
             .map_err(|e| anyhow!("Failed to insert block: {}", e))?;
         
-        // Store height -> hash mapping
+        // Store height -> UUID mapping
         let height_bytes = height.to_be_bytes();
-        self.height_index.insert(height_bytes, &block.block_hash[..])
+        self.height_index.insert(height_bytes, &block.block_header.block_uid)
             .map_err(|e| anyhow!("Failed to insert height index: {}", e))?;
+        
+        // Increment height for next block
+        *height += 1;
         
         // Flush to ensure durability
         self.db.flush()
@@ -70,46 +180,37 @@ impl SledDB {
         Ok(())
     }
     
-    /// Get a block by its hash
+    /// Retrieve a block by its height in the chain
     /// 
     /// # Arguments
-    /// * `hash` - The block hash
+    /// * `height` - The block height (0 for genesis, 1 for first block after genesis, etc.)
     /// 
     /// # Returns
-    /// The block if found, None otherwise
-    pub fn get_block_by_hash(&self, hash: &[u8; 32]) -> Result<Option<Block>> {
-        match self.blocks.get(hash)
-            .map_err(|e| anyhow!("Failed to get block: {}", e))? {
-            Some(bytes) => {
-                let block = self.deserialize_block(&bytes)?;
-                Ok(Some(block))
-            }
-            None => Ok(None)
-        }
-    }
-    
-    /// Get a block by its height
-    /// 
-    /// # Arguments
-    /// * `height` - The block height
-    /// 
-    /// # Returns
-    /// The block if found, None otherwise
+    /// - `Ok(Some(Block))` if a block exists at this height
+    /// - `Ok(None)` if no block exists at this height
+    /// - `Err(_)` if a database or deserialization error occurs
     pub fn get_block_by_height(&self, height: u64) -> Result<Option<Block>> {
         let height_bytes = height.to_be_bytes();
         
         match self.height_index.get(height_bytes)
             .map_err(|e| anyhow!("Failed to get height index: {}", e))? {
-            Some(hash_bytes) => {
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&hash_bytes);
-                self.get_block_by_hash(&hash)
+            Some(uuid_bytes) => {
+                let mut uuid = [0u8; 16];
+                uuid.copy_from_slice(&uuid_bytes);
+                self.get_block_by_uuid(&uuid)
             }
             None => Ok(None)
         }
     }
     
-    /// Get the current blockchain height (number of blocks - 1)
+    /// Get the height of the last block in the chain
+    /// 
+    /// Returns the maximum height value in the height index. For an empty
+    /// blockchain, returns 0. Note that this reads from the database index,
+    /// not from the `current_height` mutex.
+    /// 
+    /// # Returns
+    /// The height of the last block, or 0 for an empty chain
     pub fn get_height(&self) -> Result<u64> {
         match self.height_index.last()
             .map_err(|e| anyhow!("Failed to get last height: {}", e))? {
@@ -122,121 +223,129 @@ impl SledDB {
         }
     }
     
-    /// Get the latest block (tip of the chain)
+    /// Get the most recently inserted block
+    /// 
+    /// Returns the block at the highest height (current_height - 1).
+    /// Returns `None` for an empty blockchain.
+    /// 
+    /// # Returns
+    /// - `Ok(Some(Block))` if blocks exist
+    /// - `Ok(None)` if the blockchain is empty
+    /// - `Err(_)` if a database or deserialization error occurs
     pub fn get_latest_block(&self) -> Result<Option<Block>> {
-        let height = self.get_height()?;
-        self.get_block_by_height(height)
+        let height = *self.current_height.lock().unwrap();
+        if height == 0 {
+            Ok(None)
+        } else {
+            self.get_block_by_height(height - 1)
+        }
     }
     
-    /// Check if a block exists by hash
-    pub fn block_exists(&self, hash: &[u8; 32]) -> Result<bool> {
-        self.blocks.contains_key(hash)
+    /// Check if a block with the given UUID exists in the database
+    /// 
+    /// # Arguments
+    /// * `uuid` - The block's UUID (16 bytes)
+    /// 
+    /// # Returns
+    /// `Ok(true)` if the block exists, `Ok(false)` otherwise
+    pub fn block_exists(&self, uuid: &[u8; 16]) -> Result<bool> {
+        self.blocks.contains_key(uuid)
             .map_err(|e| anyhow!("Failed to check block existence: {}", e))
     }
     
-    /// Get the total number of blocks in the chain
+    /// Retrieve a block by its UUID
+    /// 
+    /// Directly queries the blocks tree using the UUID as the key.
+    /// 
+    /// # Arguments
+    /// * `uuid` - The block's UUID (16 bytes)
+    /// 
+    /// # Returns
+    /// - `Ok(Some(Block))` if the block exists
+    /// - `Ok(None)` if no block with this UUID exists
+    /// - `Err(_)` if a database or deserialization error occurs
+    pub fn get_block_by_uuid(&self, uuid: &[u8; 16]) -> Result<Option<Block>> {
+        match self.blocks.get(uuid)
+            .map_err(|e| anyhow!("Failed to get block by UUID: {}", e))? {
+            Some(block_bytes) => {
+                let block = deserialize_block(&block_bytes)
+                    .ok_or_else(|| anyhow!("Failed to deserialize block"))?;
+                Ok(Some(block))
+            }
+            None => Ok(None)
+        }
+    }
+    
+    /// Get the total number of blocks stored in the blockchain
+    /// 
+    /// # Returns
+    /// The count of blocks in the database
     pub fn block_count(&self) -> Result<usize> {
         Ok(self.blocks.len())
     }
     
-    /// Serialize a block to bytes
+    /// Create an iterator over all blocks in the blockchain, ordered by height
     /// 
-    /// Format:
-    /// - Block UID (16 bytes)
-    /// - Version (4 bytes)
-    /// - Parent hash (32 bytes)
-    /// - Timestamp (8 bytes)
-    /// - Nonce (8 bytes)
-    /// - Block hash (32 bytes)
-    /// - Data length (4 bytes)
-    /// - Block data (variable)
-    fn serialize_block(&self, block: &Block) -> Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        
-        // Header fields
-        bytes.extend_from_slice(&block.block_header.block_uid);
-        bytes.extend_from_slice(&block.block_header.version.to_le_bytes());
-        bytes.extend_from_slice(&block.block_header.parent_hash);
-        bytes.extend_from_slice(&block.block_header.timestamp.to_le_bytes());
-        bytes.extend_from_slice(&block.block_header.nonce.to_le_bytes());
-        
-        // Block hash
-        bytes.extend_from_slice(&block.block_hash);
-        
-        // Block data (with length prefix)
-        let data_len = block.block_data.len() as u32;
-        bytes.extend_from_slice(&data_len.to_le_bytes());
-        bytes.extend_from_slice(&block.block_data);
-        
-        Ok(bytes)
+    /// The iterator starts at height 0 and continues to the current maximum height.
+    /// Blocks are yielded in ascending height order (genesis first).
+    /// 
+    /// # Returns
+    /// A `BlockIterator` that yields `Result<Block>` in ascending height order
+    /// 
+    /// # Example
+    /// ```no_run
+    /// # use libblockchain::blockchain::BlockChain;
+    /// # fn example(chain: &BlockChain) -> anyhow::Result<()> {
+    /// for block_result in chain.iter() {
+    ///     let block = block_result?;
+    ///     println!("Block: {:?}", block.block_hash);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn iter(&self) -> BlockIterator<'_> {
+        let max_height = *self.current_height.lock().unwrap();
+        BlockIterator {
+            db: self,
+            current_height: 0,
+            max_height,
+        }
     }
+}
+
+/// Iterator over blocks in the blockchain, ordered by height
+///
+/// This iterator traverses blocks sequentially from height 0 to the maximum
+/// height captured at iterator creation. Blocks inserted after the iterator
+/// is created will not be included.
+///
+/// Each iteration queries the database by height, so blocks are guaranteed
+/// to be in chain order.
+pub struct BlockIterator<'a> {
+    /// Reference to the blockchain database
+    db: &'a BlockChain,
+    /// Current position in the iteration
+    current_height: u64,
+    /// Maximum height to iterate to (inclusive, but needs -1 adjustment)
+    max_height: u64,
+}
+
+impl<'a> Iterator for BlockIterator<'a> {
+    type Item = Result<Block>;
     
-    /// Deserialize a block from bytes
-    fn deserialize_block(&self, bytes: &[u8]) -> Result<Block> {
-        if bytes.len() < 104 { // Minimum size without data
-            return Err(anyhow!("Invalid block data: too short"));
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_height > self.max_height {
+            return None;
         }
         
-        let mut offset = 0;
+        let block = self.db.get_block_by_height(self.current_height);
+        self.current_height += 1;
         
-        // Block UID (16 bytes)
-        let mut block_uid = [0u8; 16];
-        block_uid.copy_from_slice(&bytes[offset..offset + 16]);
-        offset += 16;
-        
-        // Version (4 bytes)
-        let version = u32::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]
-        ]);
-        offset += 4;
-        
-        // Parent hash (32 bytes)
-        let mut parent_hash = [0u8; 32];
-        parent_hash.copy_from_slice(&bytes[offset..offset + 32]);
-        offset += 32;
-        
-        // Timestamp (8 bytes)
-        let timestamp = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]
-        ]);
-        offset += 8;
-        
-        // Nonce (8 bytes)
-        let nonce = u64::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]
-        ]);
-        offset += 8;
-        
-        // Block hash (32 bytes)
-        let mut block_hash = [0u8; 32];
-        block_hash.copy_from_slice(&bytes[offset..offset + 32]);
-        offset += 32;
-        
-        // Data length (4 bytes)
-        let data_len = u32::from_le_bytes([
-            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]
-        ]) as usize;
-        offset += 4;
-        
-        // Block data
-        if bytes.len() < offset + data_len {
-            return Err(anyhow!("Invalid block data: data length mismatch"));
+        match block {
+            Ok(Some(b)) => Some(Ok(b)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
         }
-        let block_data = bytes[offset..offset + data_len].to_vec();
-        
-        Ok(Block {
-            block_header: crate::block::BlockHeader {
-                block_uid,
-                version,
-                parent_hash,
-                timestamp,
-                nonce,
-            },
-            block_hash,
-            block_data,
-        })
     }
 }
 
@@ -304,7 +413,7 @@ mod tests {
     #[test]
     fn test_sled_db_creation() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let db = SledDB::new(temp_dir.path()).expect("Failed to create SledDB");
+        let db = BlockChain::new(temp_dir.path()).expect("Failed to create BlockChain");
         
         assert_eq!(db.block_count().unwrap(), 0);
     }
@@ -312,61 +421,60 @@ mod tests {
     #[test]
     fn test_insert_and_retrieve_block() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let db = SledDB::new(temp_dir.path()).expect("Failed to create SledDB");
+        let db = BlockChain::new(temp_dir.path()).expect("Failed to create BlockChain");
         
         let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
         let cert = generate_test_cert(&private_key).expect("Failed to generate certificate");
         
-        let genesis = Block::new_genesis_block(b"Genesis data".to_vec(), cert);
+        db.insert_block(b"Genesis data".to_vec(), cert).expect("Failed to insert block");
         
-        db.insert_block(&genesis, 0).expect("Failed to insert block");
-        
-        let retrieved = db.get_block_by_hash(&genesis.block_hash)
+        let retrieved = db.get_block_by_height(0)
             .expect("Failed to get block")
             .expect("Block not found");
         
-        assert_eq!(retrieved.block_hash, genesis.block_hash);
-        assert_eq!(retrieved.block_header.block_uid, genesis.block_header.block_uid);
+        assert_eq!(retrieved.block_header.parent_hash, [0u8; 32]);
     }
 
     #[test]
     fn test_get_block_by_height() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let db = SledDB::new(temp_dir.path()).expect("Failed to create SledDB");
+        let db = BlockChain::new(temp_dir.path()).expect("Failed to create BlockChain");
         
         let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
         let cert = generate_test_cert(&private_key).expect("Failed to generate certificate");
         
-        let genesis = Block::new_genesis_block(b"Genesis".to_vec(), cert.clone());
-        db.insert_block(&genesis, 0).expect("Failed to insert genesis");
-        
-        let block1 = Block::new_regular_block(genesis.block_hash, b"Block 1".to_vec(), cert);
-        db.insert_block(&block1, 1).expect("Failed to insert block 1");
+        db.insert_block(b"Genesis".to_vec(), cert.clone()).expect("Failed to insert genesis");
+        db.insert_block(b"Block 1".to_vec(), cert).expect("Failed to insert block 1");
         
         let retrieved = db.get_block_by_height(1)
             .expect("Failed to get block")
             .expect("Block not found");
         
-        assert_eq!(retrieved.block_hash, block1.block_hash);
+        let genesis = db.get_block_by_height(0)
+            .expect("Failed to get genesis")
+            .expect("Genesis not found");
+        
+        assert_eq!(retrieved.block_header.parent_hash, genesis.block_hash);
     }
 
     #[test]
     fn test_get_latest_block() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let db = SledDB::new(temp_dir.path()).expect("Failed to create SledDB");
+        let db = BlockChain::new(temp_dir.path()).expect("Failed to create BlockChain");
         
         let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
         let cert = generate_test_cert(&private_key).expect("Failed to generate certificate");
         
-        let genesis = Block::new_genesis_block(b"Genesis".to_vec(), cert.clone());
-        db.insert_block(&genesis, 0).expect("Failed to insert genesis");
-        
-        let block1 = Block::new_regular_block(genesis.block_hash, b"Block 1".to_vec(), cert);
-        db.insert_block(&block1, 1).expect("Failed to insert block 1");
+        db.insert_block(b"Genesis".to_vec(), cert.clone()).expect("Failed to insert genesis");
+        db.insert_block(b"Block 1".to_vec(), cert).expect("Failed to insert block 1");
         
         let latest = db.get_latest_block()
             .expect("Failed to get latest block")
             .expect("No latest block");
+        
+        let block1 = db.get_block_by_height(1)
+            .expect("Failed to get block 1")
+            .expect("Block 1 not found");
         
         assert_eq!(latest.block_hash, block1.block_hash);
     }
@@ -374,21 +482,56 @@ mod tests {
     #[test]
     fn test_block_count() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let db = SledDB::new(temp_dir.path()).expect("Failed to create SledDB");
+        let db = BlockChain::new(temp_dir.path()).expect("Failed to create BlockChain");
         
         let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
         let cert = generate_test_cert(&private_key).expect("Failed to generate certificate");
         
         assert_eq!(db.block_count().unwrap(), 0);
         
-        let genesis = Block::new_genesis_block(b"Genesis".to_vec(), cert.clone());
-        db.insert_block(&genesis, 0).expect("Failed to insert genesis");
+        db.insert_block(b"Genesis".to_vec(), cert.clone()).expect("Failed to insert genesis");
         
         assert_eq!(db.block_count().unwrap(), 1);
         
-        let block1 = Block::new_regular_block(genesis.block_hash, b"Block 1".to_vec(), cert);
-        db.insert_block(&block1, 1).expect("Failed to insert block 1");
+        db.insert_block(b"Block 1".to_vec(), cert).expect("Failed to insert block 1");
         
         assert_eq!(db.block_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_iterator() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db = BlockChain::new(temp_dir.path()).expect("Failed to create BlockChain");
+        
+        let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
+        let cert = generate_test_cert(&private_key).expect("Failed to generate certificate");
+        
+        // Create a blockchain with 5 blocks
+        db.insert_block(b"Genesis".to_vec(), cert.clone()).expect("Failed to insert genesis");
+        
+        for i in 1..5 {
+            db.insert_block(format!("Block {}", i).into_bytes(), cert.clone())
+                .expect(&format!("Failed to insert block {}", i));
+        }
+        
+        // Iterate over all blocks
+        let blocks: Vec<_> = db.iter().collect::<Result<Vec<_>>>().expect("Failed to collect blocks");
+        
+        assert_eq!(blocks.len(), 5);
+        
+        // Verify blocks are in order
+        for i in 1..blocks.len() {
+            assert_eq!(blocks[i].block_header.parent_hash, blocks[i - 1].block_hash);
+        }
+    }
+
+    #[test]
+    fn test_empty_iterator() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db = BlockChain::new(temp_dir.path()).expect("Failed to create BlockChain");
+        
+        let blocks: Vec<_> = db.iter().collect::<Result<Vec<_>>>().expect("Failed to collect blocks");
+        
+        assert_eq!(blocks.len(), 0);
     }
 }

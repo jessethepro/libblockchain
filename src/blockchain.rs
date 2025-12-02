@@ -303,6 +303,83 @@ impl BlockChain {
         Ok(self.blocks.len())
     }
 
+    /// Validate the entire blockchain for integrity
+    ///
+    /// Checks all blocks in the chain to ensure:
+    /// - Genesis block (height 0) has a zero parent hash
+    /// - All subsequent blocks correctly link to their parent
+    /// - Block hashes match their computed values
+    /// - No gaps in the height sequence
+    ///
+    /// # Returns
+    /// - `Ok(())` if the blockchain is valid
+    /// - `Err(_)` with details if validation fails
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use libblockchain::blockchain::BlockChain;
+    /// # fn example(chain: &BlockChain) -> anyhow::Result<()> {
+    /// chain.validate()?;
+    /// println!("Blockchain is valid!");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn validate(&self) -> Result<()> {
+        let height = *self.current_height.lock().unwrap();
+
+        if height == 0 {
+            // Empty blockchain is valid
+            return Ok(());
+        }
+
+        let mut previous_block: Option<Block> = None;
+
+        for h in 0..height {
+            let block = self
+                .get_block_by_height(h)?
+                .ok_or_else(|| anyhow!("Missing block at height {}", h))?;
+
+            // Validate genesis block
+            if h == 0 {
+                if block.block_header.parent_hash != [0u8; 32] {
+                    return Err(anyhow!(
+                        "Genesis block has non-zero parent hash: {:?}",
+                        block.block_header.parent_hash
+                    ));
+                }
+            } else {
+                // Validate parent link
+                let prev = previous_block
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Internal error: missing previous block"))?;
+
+                if block.block_header.parent_hash != prev.block_hash {
+                    return Err(anyhow!(
+                        "Block at height {} has invalid parent hash. Expected {:?}, got {:?}",
+                        h,
+                        prev.block_hash,
+                        block.block_header.parent_hash
+                    ));
+                }
+            }
+
+            // Validate block hash matches header
+            let computed_hash = block.block_header.generate_block_hash();
+            if block.block_hash != computed_hash {
+                return Err(anyhow!(
+                    "Block at height {} has invalid hash. Expected {:?}, got {:?}",
+                    h,
+                    computed_hash,
+                    block.block_hash
+                ));
+            }
+
+            previous_block = Some(block);
+        }
+
+        Ok(())
+    }
+
     /// Create an iterator over all blocks in the blockchain, ordered by height
     ///
     /// The iterator starts at height 0 and continues to the current maximum height.
@@ -628,6 +705,63 @@ mod tests {
 
             // Verify block 3 links to block 2
             assert_eq!(block3.block_header.parent_hash, block2.block_hash);
+        }
+    }
+
+    #[test]
+    fn test_validate_valid_chain() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db = BlockChain::new(temp_dir.path()).expect("Failed to create BlockChain");
+
+        let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
+        let cert = generate_test_cert(&private_key).expect("Failed to generate certificate");
+
+        // Empty chain should be valid
+        db.validate().expect("Empty blockchain should be valid");
+
+        // Add blocks
+        db.insert_block(b"Genesis".to_vec(), cert.clone())
+            .expect("Failed to insert genesis");
+        db.validate()
+            .expect("Blockchain with genesis should be valid");
+
+        db.insert_block(b"Block 1".to_vec(), cert.clone())
+            .expect("Failed to insert block 1");
+        db.validate()
+            .expect("Blockchain with 2 blocks should be valid");
+
+        db.insert_block(b"Block 2".to_vec(), cert)
+            .expect("Failed to insert block 2");
+        db.validate()
+            .expect("Blockchain with 3 blocks should be valid");
+    }
+
+    #[test]
+    fn test_validate_after_persistence() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = temp_dir.path();
+
+        let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
+        let cert = generate_test_cert(&private_key).expect("Failed to generate certificate");
+
+        // Create blockchain with blocks
+        {
+            let db = BlockChain::new(path).expect("Failed to create BlockChain");
+            db.insert_block(b"Genesis".to_vec(), cert.clone())
+                .expect("Failed to insert genesis");
+            db.insert_block(b"Block 1".to_vec(), cert.clone())
+                .expect("Failed to insert block 1");
+            db.insert_block(b"Block 2".to_vec(), cert.clone())
+                .expect("Failed to insert block 2");
+            db.validate()
+                .expect("Blockchain should be valid before close");
+        }
+
+        // Reopen and validate
+        {
+            let db = BlockChain::new(path).expect("Failed to reopen BlockChain");
+            db.validate()
+                .expect("Blockchain should be valid after reopen");
         }
     }
 }

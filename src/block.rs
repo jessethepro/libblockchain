@@ -405,8 +405,8 @@ mod tests {
         let block = Block::new_genesis_block(original_data.clone(), cert);
 
         // Use the static method to decrypt block data
-        let decrypted_data = Block::get_block_data(block, &private_key)
-            .expect("Failed to decrypt block data");
+        let decrypted_data =
+            Block::get_block_data(block, &private_key).expect("Failed to decrypt block data");
 
         assert_eq!(decrypted_data, original_data);
     }
@@ -421,8 +421,8 @@ mod tests {
         let block = Block::new_regular_block(parent_hash, original_data.clone(), cert);
 
         // Decrypt using static method
-        let decrypted_data = Block::get_block_data(block, &private_key)
-            .expect("Failed to decrypt block data");
+        let decrypted_data =
+            Block::get_block_data(block, &private_key).expect("Failed to decrypt block data");
 
         assert_eq!(decrypted_data, original_data);
     }

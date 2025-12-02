@@ -238,6 +238,37 @@ impl BlockChain {
         }
     }
 
+    /// Get the encrypted block data at a specific height
+    ///
+    /// Retrieves the block at the given height and returns only its encrypted
+    /// `block_data` field. This is useful when you only need the data payload
+    /// without the full block structure.
+    ///
+    /// # Arguments
+    /// * `height` - The block height to query
+    ///
+    /// # Returns
+    /// - `Ok(Some(Vec<u8>))` - The encrypted block data if block exists
+    /// - `Ok(None)` - If no block exists at this height
+    /// - `Err(_)` - If a database or deserialization error occurs
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use libblockchain::blockchain::BlockChain;
+    /// # fn example(chain: &BlockChain) -> anyhow::Result<()> {
+    /// if let Some(encrypted_data) = chain.get_data_at_height(5)? {
+    ///     // Use encrypted_data (decrypt with Block::get_block_data)
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_data_at_height(&self, height: u64) -> Result<Option<Vec<u8>>> {
+        match self.get_block_by_height(height)? {
+            Some(block) => Ok(Some(block.block_data)),
+            None => Ok(None),
+        }
+    }
+
     /// Get the most recently inserted block
     ///
     /// Returns the block at the highest height (current_height - 1).
@@ -759,5 +790,66 @@ mod tests {
             db.validate()
                 .expect("Blockchain should be valid after reopen");
         }
+    }
+
+    #[test]
+    fn test_get_data_at_height() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db = BlockChain::new(temp_dir.path()).expect("Failed to create BlockChain");
+
+        let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
+        let cert = generate_test_cert(&private_key).expect("Failed to generate certificate");
+
+        // Insert blocks with different data
+        let data0 = b"Genesis block data".to_vec();
+        let data1 = b"First block data".to_vec();
+        let data2 = b"Second block data".to_vec();
+
+        db.insert_block(data0.clone(), cert.clone())
+            .expect("Failed to insert genesis");
+        db.insert_block(data1.clone(), cert.clone())
+            .expect("Failed to insert block 1");
+        db.insert_block(data2.clone(), cert)
+            .expect("Failed to insert block 2");
+
+        // Test getting data at different heights
+        let encrypted_data0 = db
+            .get_data_at_height(0)
+            .expect("Failed to get data at height 0")
+            .expect("No data at height 0");
+        let encrypted_data1 = db
+            .get_data_at_height(1)
+            .expect("Failed to get data at height 1")
+            .expect("No data at height 1");
+        let encrypted_data2 = db
+            .get_data_at_height(2)
+            .expect("Failed to get data at height 2")
+            .expect("No data at height 2");
+
+        // Verify data is encrypted (not equal to plaintext)
+        assert_ne!(encrypted_data0, data0);
+        assert_ne!(encrypted_data1, data1);
+        assert_ne!(encrypted_data2, data2);
+
+        // Decrypt and verify
+        use crate::hybrid_encryption::hybrid_decrypt_from_bytes;
+
+        let decrypted0 = hybrid_decrypt_from_bytes(&private_key, &encrypted_data0)
+            .expect("Failed to decrypt data 0");
+        let decrypted1 = hybrid_decrypt_from_bytes(&private_key, &encrypted_data1)
+            .expect("Failed to decrypt data 1");
+        let decrypted2 = hybrid_decrypt_from_bytes(&private_key, &encrypted_data2)
+            .expect("Failed to decrypt data 2");
+
+        assert_eq!(decrypted0, data0);
+        assert_eq!(decrypted1, data1);
+        assert_eq!(decrypted2, data2);
+
+        // Test non-existent height
+        assert!(
+            db.get_data_at_height(99)
+                .expect("Failed to query height 99")
+                .is_none()
+        );
     }
 }

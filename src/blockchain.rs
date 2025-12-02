@@ -305,11 +305,14 @@ impl BlockChain {
 
     /// Validate the entire blockchain for integrity
     ///
-    /// Checks all blocks in the chain to ensure:
+    /// Uses the `BlockIterator` to traverse all blocks in height order,
+    /// checking each block's cryptographic integrity and chain linkage.
+    ///
+    /// Validates:
     /// - Genesis block (height 0) has a zero parent hash
-    /// - All subsequent blocks correctly link to their parent
-    /// - Block hashes match their computed values
-    /// - No gaps in the height sequence
+    /// - All subsequent blocks correctly link to their parent's hash
+    /// - Each block's hash matches its computed value from the header
+    /// - The chain has no gaps (iterator ensures sequential heights)
     ///
     /// # Returns
     /// - `Ok(())` if the blockchain is valid
@@ -325,22 +328,14 @@ impl BlockChain {
     /// # }
     /// ```
     pub fn validate(&self) -> Result<()> {
-        let height = *self.current_height.lock().unwrap();
-
-        if height == 0 {
-            // Empty blockchain is valid
-            return Ok(());
-        }
-
         let mut previous_block: Option<Block> = None;
+        let mut height = 0u64;
 
-        for h in 0..height {
-            let block = self
-                .get_block_by_height(h)?
-                .ok_or_else(|| anyhow!("Missing block at height {}", h))?;
+        for block_result in self.iter() {
+            let block = block_result?;
 
             // Validate genesis block
-            if h == 0 {
+            if height == 0 {
                 if block.block_header.parent_hash != [0u8; 32] {
                     return Err(anyhow!(
                         "Genesis block has non-zero parent hash: {:?}",
@@ -356,7 +351,7 @@ impl BlockChain {
                 if block.block_header.parent_hash != prev.block_hash {
                     return Err(anyhow!(
                         "Block at height {} has invalid parent hash. Expected {:?}, got {:?}",
-                        h,
+                        height,
                         prev.block_hash,
                         block.block_header.parent_hash
                     ));
@@ -368,13 +363,14 @@ impl BlockChain {
             if block.block_hash != computed_hash {
                 return Err(anyhow!(
                     "Block at height {} has invalid hash. Expected {:?}, got {:?}",
-                    h,
+                    height,
                     computed_hash,
                     block.block_hash
                 ));
             }
 
             previous_block = Some(block);
+            height += 1;
         }
 
         Ok(())

@@ -352,7 +352,9 @@ Contributions should maintain:
 
 ## License
 
-[Specify your license here]
+MIT License - see [LICENSE](LICENSE) file for details.
+
+Copyright (c) 2025 jessethepro
 
 ## What This Library Does **Not** Include
 

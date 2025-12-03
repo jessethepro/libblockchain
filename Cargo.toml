@@ -2,6 +2,13 @@
 name = "libblockchain"
 version = "0.1.0"
 edition = "2024"
+authors = ["jessethepro"]
+license = "MIT"
+description = "A generic, lightweight blockchain library with persistent storage, hybrid encryption, and secure key management"
+repository = "https://github.com/jessethepro/libblockchain"
+keywords = ["blockchain", "cryptography", "storage", "encryption", "sled"]
+categories = ["cryptography", "data-structures", "database"]
+readme = "README.md"
 
 [dependencies]
 rand = "0.9.2"

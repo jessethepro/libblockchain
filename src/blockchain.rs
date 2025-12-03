@@ -400,9 +400,8 @@ impl BlockChain {
                 }
             }
 
-            // Block hash is computed during construction, just verify it's not zero
-            if block.block_hash == [0u8; 64] {
-                return Err(anyhow!("Block at height {} has zero hash", height));
+            if block.block_hash != block.block_header.generate_block_hash() {
+                return Err(anyhow!("Block hash mismatch at height {}", height));
             }
 
             previous_block = Some(block);

@@ -26,16 +26,14 @@
 //!
 //! ```no_run
 //! use libblockchain::blockchain::BlockChain;
-//! # use openssl::x509::X509;
 //!
 //! # fn example() -> anyhow::Result<()> {
-//! // Create a blockchain
-//! let chain = BlockChain::new("./my_blockchain")?;
+//! // Create a blockchain with private key for decryption
+//! let chain = BlockChain::new("./my_blockchain", "./app_private_key.pem")?;
 //!
-//! // Insert blocks (certificate needed for encryption)
-//! # let cert: X509 = unsafe { std::mem::zeroed() };
-//! chain.insert_block(b"My genesis data".to_vec(), cert.clone())?;
-//! chain.insert_block(b"Second block data".to_vec(), cert)?;
+//! // Insert blocks (automatically encrypted with stored public key)
+//! chain.insert_block(b"My genesis data".to_vec())?;
+//! chain.insert_block(b"Second block data".to_vec())?;
 //!
 //! // Query blocks
 //! let genesis = chain.get_block_by_height(0)?.unwrap();
@@ -58,13 +56,11 @@
 //! - **Thread-safe**: Mutex-protected height counter for concurrent access
 //!
 
+pub mod app_key_store;
 pub mod block;
 pub mod blockchain;
-pub mod hybrid_encryption;
 pub mod db_model;
+pub mod hybrid_encryption;
 
 // Re-export uuid for convenience
 pub use uuid;
-
-// Re-export CertificateTools from libcertcrypto
-pub use libcertcrypto::CertificateTools;

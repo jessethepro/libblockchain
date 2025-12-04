@@ -76,7 +76,7 @@ pub struct BlockChain {
     current_height: Mutex<u64>,
 
     /// Secure container for the application's private key
-    app_key_store: crate::app_key_store::AppKeyStore,
+    pub app_key_store: crate::app_key_store::AppKeyStore,
 }
 
 impl BlockChain {

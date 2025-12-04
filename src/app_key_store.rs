@@ -106,7 +106,27 @@ impl AppKeyStore {
         let pkey = PKey::private_key_from_der(der_bytes)
             .context("Failed to reconstruct private key from secure storage")?;
 
-        Block::get_block_data(block, &pkey)
+        use crate::hybrid_encryption::{
+            HybridEncryptedData, decrypt_aes_256_gcm, decrypt_rsa_oaep,
+        };
+        let data = HybridEncryptedData::from_bytes(&block.block_data)?;
+
+        // 1. Decrypt AES key with RSA-OAEP
+        let aes_key = decrypt_rsa_oaep(&data.encrypted_aes_key, &pkey)?;
+
+        // Validate AES key length
+        use anyhow::anyhow;
+        if aes_key.len() != 32 {
+            return Err(anyhow!(
+                "Invalid AES key length: expected 32 bytes, got {}",
+                aes_key.len()
+            ));
+        }
+
+        // 2. Decrypt and verify authentication tag
+        let plaintext = decrypt_aes_256_gcm(&data.ciphertext, &aes_key, &data.nonce, &data.tag)?;
+
+        Ok(plaintext)
     }
 }
 

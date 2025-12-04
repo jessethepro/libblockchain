@@ -147,8 +147,26 @@ impl Block {
     /// # }
     /// ```
     pub fn get_block_data(block: Block, private_key: &PKey<Private>) -> Result<Vec<u8>> {
-        use crate::hybrid_encryption::hybrid_decrypt;
-        hybrid_decrypt(private_key, block.block_data)
+        use crate::hybrid_encryption::{
+            HybridEncryptedData, decrypt_aes_256_gcm, decrypt_rsa_oaep,
+        };
+        let data = HybridEncryptedData::from_bytes(&block.block_data)?;
+
+        // 1. Decrypt AES key with RSA-OAEP
+        let aes_key = decrypt_rsa_oaep(&data.encrypted_aes_key, private_key)?;
+
+        // Validate AES key length
+        if aes_key.len() != 32 {
+            return Err(anyhow!(
+                "Invalid AES key length: expected 32 bytes, got {}",
+                aes_key.len()
+            ));
+        }
+
+        // 2. Decrypt and verify authentication tag
+        let plaintext = decrypt_aes_256_gcm(&data.ciphertext, &aes_key, &data.nonce, &data.tag)?;
+
+        Ok(plaintext)
     }
 
     pub fn serialize_block(&self) -> Vec<u8> {

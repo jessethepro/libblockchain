@@ -563,7 +563,12 @@ impl BlockChain {
     /// # }
     /// ```
     pub fn iter(&self) -> BlockIterator<'_> {
-        let max_height = *self.current_height.lock().unwrap();
+        let current_height = *self.current_height.lock().unwrap();
+        let max_height = if current_height > 0 {
+            current_height - 1
+        } else {
+            0
+        };
         BlockIterator {
             db: self,
             current_height: 0,
@@ -585,7 +590,7 @@ pub struct BlockIterator<'a> {
     db: &'a BlockChain,
     /// Current position in the iteration
     current_height: u64,
-    /// Maximum height to iterate to (inclusive, but needs -1 adjustment)
+    /// Maximum height to iterate to (inclusive)
     max_height: u64,
 }
 

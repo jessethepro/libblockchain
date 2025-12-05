@@ -16,7 +16,7 @@
 //! The `current_height` field is protected by a `Mutex` to allow safe
 //! concurrent access. This represents the next height to be assigned.
 
-use crate::block::Block;
+use crate::block::{BLOCK_HASH_SIZE, BLOCK_UID_SIZE, Block};
 use crate::db_model::SledDb;
 use anyhow::{Context, Result, anyhow};
 use openssl::pkey::PKey;
@@ -437,7 +437,7 @@ impl BlockChain {
     ///
     /// # Returns
     /// `Ok(true)` if the block exists, `Ok(false)` otherwise
-    pub fn block_exists(&self, uuid: &[u8; 16]) -> Result<bool> {
+    pub fn block_exists(&self, uuid: &[u8; BLOCK_UID_SIZE]) -> Result<bool> {
         self.blocks
             .contains_key(uuid)
             .map_err(|e| anyhow!("Failed to check block existence: {}", e))
@@ -454,7 +454,7 @@ impl BlockChain {
     /// - `Ok(Some(Block))` if the block exists
     /// - `Ok(None)` if no block with this UUID exists
     /// - `Err(_)` if a database or deserialization error occurs
-    pub fn get_block_by_uuid(&self, uuid: &[u8; 16]) -> Result<Option<Block>> {
+    pub fn get_block_by_uuid(&self, uuid: &[u8; BLOCK_UID_SIZE]) -> Result<Option<Block>> {
         match self
             .blocks
             .get(uuid)
@@ -510,7 +510,7 @@ impl BlockChain {
 
             // Validate genesis block
             if height == 0 {
-                if block.block_header.parent_hash != [0u8; 64] {
+                if block.block_header.parent_hash != [0u8; BLOCK_HASH_SIZE] {
                     return Err(anyhow!(
                         "Genesis block has non-zero parent hash: {:?}",
                         block.block_header.parent_hash

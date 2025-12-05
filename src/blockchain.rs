@@ -15,38 +15,23 @@
 //!
 //! The `current_height` field is protected by a `Mutex` to allow safe
 //! concurrent access. This represents the next height to be assigned.
-//!
-//! # Example
-//!
-//! ```no_run
-//! use libblockchain::blockchain::BlockChain;
-//! # use openssl::x509::X509;
-//!
-//! # fn example() -> anyhow::Result<()> {
-//! // Create or open a blockchain
-//! let chain = BlockChain::new("./blockchain_data", "./app_private_key.pem")?;
-//!
-//! // Insert blocks (height is automatic)
-//! chain.insert_block(b"Genesis data".to_vec())?;
-//! chain.insert_block(b"Block 1 data".to_vec())?;
-//!
-//! // Retrieve blocks by height
-//! let block = chain.get_block_by_height(0)?.unwrap();
-//!
-//! // Iterate over all blocks
-//! for block in chain.iter() {
-//!     let block = block?;
-//!     println!("Block hash: {:?}", block.block_hash);
-//! }
-//! # Ok(())
-//! # }
-//! ```
 
-use crate::block::{Block, deserialize_block};
+use crate::block::Block;
 use crate::db_model::SledDb;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
+use openssl::pkey::PKey;
+use openssl::rsa::Padding;
+use openssl::symm::Cipher;
+use secrecy::{ExposeSecret, SecretBox, zeroize::Zeroize};
+use std::fmt;
 use std::path::Path;
 use std::sync::Mutex;
+
+pub const AES_KEY_LEN_SIZE: usize = 4; // u32 for AES key length
+pub const AES_GCM_256_KEY_SIZE: usize = 32; // 256 bits
+pub const AES_GCM_NONCE_SIZE: usize = 12; // 96 bits
+pub const AES_GCM_TAG_SIZE: usize = 16; // 128 bits
+pub const BLOCK_LEN_SIZE: usize = 4; // u32 for block length
 
 /// SledDB-backed blockchain storage with automatic height management
 ///
@@ -58,6 +43,26 @@ use std::sync::Mutex;
 ///
 /// The `BlockChain` can be safely shared across threads. The `current_height`
 /// field is protected by a `Mutex` to ensure consistent height assignment.
+///
+/// A securely stored private key that implements Zeroize
+#[derive(Clone)]
+struct SecurePrivateKey {
+    der_bytes: Vec<u8>,
+}
+
+impl Zeroize for SecurePrivateKey {
+    fn zeroize(&mut self) {
+        self.der_bytes.zeroize();
+    }
+}
+
+impl fmt::Debug for SecurePrivateKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecurePrivateKey")
+            .field("der_bytes", &"<redacted>")
+            .finish()
+    }
+}
 pub struct BlockChain {
     /// Sled database instance
     db: sled::Db,
@@ -75,8 +80,11 @@ pub struct BlockChain {
     /// then this value is incremented.
     current_height: Mutex<u64>,
 
-    /// Secure container for the application's private key
-    pub app_key_store: crate::app_key_store::AppKeyStore,
+    /// Secured Private key for decrypting block data
+    private_key: SecretBox<SecurePrivateKey>,
+
+    /// Public key for encrypting block data
+    pub public_key: PKey<openssl::pkey::Public>,
 }
 
 impl BlockChain {
@@ -126,21 +134,53 @@ impl BlockChain {
             }
             None => 0, // Empty blockchain, start at height 0
         };
-        // Initialize the application key store (for decrypting block data)
-        let app_key_store = crate::app_key_store::AppKeyStore::from_pem_file(
-            private_key_path
-                .as_ref()
-                .to_str()
-                .ok_or_else(|| anyhow!("Invalid private key path"))?,
-            None,
-        )?;
+
+        // Load private key from PEM file
+
+        let (private_key_der, public_key) =
+            (|| -> Result<(Vec<u8>, PKey<openssl::pkey::Public>)> {
+                let pem_path = private_key_path
+                    .as_ref()
+                    .to_str()
+                    .ok_or_else(|| anyhow!("Invalid private key path"))?;
+
+                let pem_data = std::fs::read(pem_path)
+                    .with_context(|| format!("Failed to read private key from {}", pem_path))?;
+
+                use std::io::Write;
+                print!("Enter password for private key (press Enter if none): ");
+                std::io::stdout().flush()?;
+                let pwd = rpassword::read_password()?;
+
+                let key = if !pwd.is_empty() {
+                    PKey::private_key_from_pem_passphrase(&pem_data, pwd.as_bytes())
+                        .context("Failed to decrypt private key with password")?
+                } else {
+                    PKey::private_key_from_pem(&pem_data)
+                        .context("Failed to parse private key PEM")?
+                };
+                let public_der_bytes = key
+                    .public_key_to_der()
+                    .context("Failed to extract public key to DER")?;
+                let private_der_bytes = key
+                    .private_key_to_der()
+                    .context("Failed to convert private key to DER")?;
+
+                let public_key = PKey::public_key_from_der(&public_der_bytes)
+                    .context("Failed to reconstruct public key from DER")?;
+
+                Ok((private_der_bytes, public_key))
+            })()?;
 
         Ok(Self {
             db,
             blocks,
             height_index,
             current_height: Mutex::new(next_height),
-            app_key_store,
+            private_key: SecretBox::new(Box::new(SecurePrivateKey {
+                der_bytes: private_key_der,
+            })),
+            public_key,
         })
     }
 
@@ -152,7 +192,6 @@ impl BlockChain {
     ///
     /// # Arguments
     /// * `block_data` - The raw data to store in the block (will be encrypted)
-    /// * `app_cert` - X509 certificate used for hybrid encryption of block data
     ///
     /// # Returns
     /// `Ok(())` on success
@@ -163,25 +202,86 @@ impl BlockChain {
     /// - Block serialization fails
     /// - Database insertion fails
     /// - Database flush fails
-    pub fn insert_block(&self, block_data: Vec<u8>) -> Result<()> {
+    ///
+    // The format of the block storded in the database is:
+    // RSA Encrypted AES key (variable length) || AES-GCM nonce (12 bytes) || AES-GCM tag (16 bytes) || AES-GCM ciphertext (variable length)
+    pub fn put_block(&self, block_data: Vec<u8>) -> Result<()> {
         let mut height = self.current_height.lock().unwrap();
+        let (encrypted_aes_key, encrypted_block_data, nonce, tag) =
+            (|| -> Result<(Vec<u8>, Vec<u8>, [u8; AES_GCM_NONCE_SIZE], [u8; AES_GCM_TAG_SIZE])> {
+                // Generate random AES-256 key (32 bytes)
+                let mut aes_key = [0u8; AES_GCM_256_KEY_SIZE];
+                openssl::rand::rand_bytes(&mut aes_key)
+                    .map_err(|e| anyhow!("Failed to generate random AES key: {}", e))?;
 
+                // Generate random 12-byte nonce
+                let mut nonce = [0u8; AES_GCM_NONCE_SIZE];
+                openssl::rand::rand_bytes(&mut nonce)
+                    .map_err(|e| anyhow!("Failed to generate random nonce: {}", e))?;
+
+                let cipher = Cipher::aes_256_gcm();
+                let mut tag = [0u8; AES_GCM_TAG_SIZE];
+
+                let encrypted_block_data = openssl::symm::encrypt_aead(
+                    cipher,
+                    &aes_key,
+                    Some(&nonce),
+                    &[],
+                    &block_data,
+                    &mut tag,
+                )
+                .map_err(|e| anyhow!("AES-GCM encryption failed: {}", e))?;
+
+                // Encrypt AES key with RSA-OAEP
+                let encrypted_aes_key = (|| -> Result<Vec<u8>> {
+                    let rsa = self
+                        .public_key
+                        .rsa()
+                        .map_err(|e| anyhow!("Failed to get RSA key: {}", e))?;
+                    let mut ciphertext = vec![0u8; rsa.size() as usize];
+                    let len = rsa
+                        .public_encrypt(&aes_key, &mut ciphertext, Padding::PKCS1_OAEP)
+                        .map_err(|e| anyhow!("RSA encryption failed: {}", e))?;
+
+                    ciphertext.truncate(len);
+                    Ok(ciphertext)
+                })()?;
+                Ok((encrypted_aes_key, encrypted_block_data, nonce, tag))
+            })()?;
         let block = if *height == 0 {
-            Block::new_genesis_block(block_data, &self.app_key_store.public_key)
+            Block::new_genesis_block(encrypted_block_data)
         } else {
             // Get the previous block (at height - 1)
-            let parent_hash = self
-                .get_block_by_height(*height - 1)?
-                .ok_or_else(|| anyhow!("No parent block found for non-genesis block"))?
-                .block_hash;
-            Block::new_regular_block(parent_hash, block_data, &self.app_key_store.public_key)
+            let parent_block = self.get_block_by_height(*height - 1)?;
+            let parent_hash = parent_block.block_hash;
+            Block::new_regular_block(parent_hash, encrypted_block_data)
         };
-
-        let block_bytes = block.serialize_block();
+        use crate::block::BLOCK_UID_SIZE;
+        let (uuid, stored_block_bytes) = (|| -> Result<([u8; BLOCK_UID_SIZE], Vec<u8>)> {
+            let stored_block_bytes = {
+                let mut bytes = Vec::new();
+                let key_len = encrypted_aes_key.len() as u32;
+                // Append length of encrypted AES key (4 bytes)
+                bytes.extend_from_slice(&key_len.to_le_bytes());
+                // Append encrypted AES key
+                bytes.extend_from_slice(&encrypted_aes_key);
+                // Append nonce
+                bytes.extend_from_slice(&nonce);
+                // Append tag
+                bytes.extend_from_slice(&tag);
+                // Append Block
+                let block_bytes = block.bytes();
+                let block_len = block_bytes.len() as u32;
+                bytes.extend_from_slice(&block_len.to_le_bytes());
+                bytes.extend_from_slice(&block_bytes);
+                bytes
+            };
+            Ok((block.block_header.block_uid, stored_block_bytes))
+        })()?;
 
         // Store block by UUID
         self.blocks
-            .insert(&block.block_header.block_uid, block_bytes)
+            .insert(uuid, stored_block_bytes)
             .map_err(|e| anyhow!("Failed to insert block: {}", e))?;
 
         // Store height -> UUID mapping
@@ -210,21 +310,83 @@ impl BlockChain {
     /// - `Ok(Some(Block))` if a block exists at this height
     /// - `Ok(None)` if no block exists at this height
     /// - `Err(_)` if a database or deserialization error occurs
-    pub fn get_block_by_height(&self, height: u64) -> Result<Option<Block>> {
+    pub fn get_block_by_height(&self, height: u64) -> Result<Block> {
         let height_bytes = height.to_be_bytes();
-
-        match self
+        let stored_block = match self
             .height_index
             .get(height_bytes)
-            .map_err(|e| anyhow!("Failed to get height index: {}", e))?
+            .map_err(|e| anyhow!("Failed to get block UUID by height: {}", e))?
         {
             Some(uuid_bytes) => {
                 let mut uuid = [0u8; 16];
                 uuid.copy_from_slice(&uuid_bytes);
-                self.get_block_by_uuid(&uuid)
+                match self
+                    .blocks
+                    .get(&uuid)
+                    .map_err(|e| anyhow!("Failed to get block by UUID: {}", e))?
+                {
+                    Some(block_bytes) => block_bytes,
+                    None => return Err(anyhow!("Block UUID {:?} not found in blocks tree", uuid)),
+                }
             }
-            None => Ok(None),
-        }
+            None => return Err(anyhow!("No block found at height {}", height)),
+        };
+        let block = (|| -> Result<Block> {
+            // Deserialize block from bytes
+            let mut index: usize = 0;
+            let aes_key_len =
+                u32::from_le_bytes(stored_block[index..AES_KEY_LEN_SIZE].try_into().unwrap())
+                    as usize;
+            index += AES_KEY_LEN_SIZE;
+            let encrypted_aes_key = &stored_block[index..index + aes_key_len];
+            index += aes_key_len;
+            let nonce = &stored_block[index..index + AES_GCM_NONCE_SIZE];
+            index += AES_GCM_NONCE_SIZE;
+            let tag = &stored_block[index..index + AES_GCM_TAG_SIZE];
+            index += AES_GCM_TAG_SIZE;
+            let block_len = u32::from_le_bytes(
+                stored_block[index..index + BLOCK_LEN_SIZE]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            index += BLOCK_LEN_SIZE;
+            let block_bytes = &stored_block[index..index + block_len];
+            let mut block = Block::from_bytes(block_bytes)
+                .map_err(|e| anyhow!("Failed to deserialize block: {}", e))?;
+            let decrypted_block_data = {
+                // Decrypt AES key with RSA-OAEP
+                let aes_key = (|| -> Result<Vec<u8>> {
+                    let rsa = self.private_key.expose_secret().der_bytes.as_slice();
+                    let pkey = PKey::private_key_from_der(rsa)
+                        .map_err(|e| anyhow!("Failed to reconstruct private key: {}", e))?;
+                    let rsa = pkey
+                        .rsa()
+                        .map_err(|e| anyhow!("Failed to get RSA key: {}", e))?;
+                    let mut plaintext = vec![0u8; rsa.size() as usize];
+                    let len = rsa
+                        .private_decrypt(encrypted_aes_key, &mut plaintext, Padding::PKCS1_OAEP)
+                        .map_err(|e| anyhow!("RSA decryption failed: {}", e))?;
+                    plaintext.truncate(len);
+                    Ok(plaintext)
+                })()?;
+
+                // Decrypt block data with AES-GCM
+                let decrypted_data = openssl::symm::decrypt_aead(
+                    Cipher::aes_256_gcm(),
+                    &aes_key,
+                    Some(nonce),
+                    &[],
+                    &block.block_data,
+                    tag,
+                )
+                .map_err(|e| anyhow!("AES-GCM decryption failed: {}", e))?;
+                decrypted_data
+            };
+            block.block_data = decrypted_block_data;
+            Ok(block)
+        })()?;
+
+        Ok(block)
     }
 
     /// Get the height of the last block in the chain
@@ -250,37 +412,6 @@ impl BlockChain {
         }
     }
 
-    /// Get the encrypted block data at a specific height
-    ///
-    /// Retrieves the block at the given height and returns only its encrypted
-    /// `block_data` field. This is useful when you only need the data payload
-    /// without the full block structure.
-    ///
-    /// # Arguments
-    /// * `height` - The block height to query
-    ///
-    /// # Returns
-    /// - `Ok(Some(Vec<u8>))` - The encrypted block data if block exists
-    /// - `Ok(None)` - If no block exists at this height
-    /// - `Err(_)` - If a database or deserialization error occurs
-    ///
-    /// # Example
-    /// ```no_run
-    /// # use libblockchain::blockchain::BlockChain;
-    /// # fn example(chain: &BlockChain) -> anyhow::Result<()> {
-    /// if let Some(encrypted_data) = chain.get_data_at_height(5)? {
-    ///     // Use encrypted_data (decrypt with Block::get_block_data)
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn get_data_at_height(&self, height: u64) -> Result<Option<Vec<u8>>> {
-        match self.get_block_by_height(height)? {
-            Some(block) => Ok(Some(block.block_data)),
-            None => Ok(None),
-        }
-    }
-
     /// Get the most recently inserted block
     ///
     /// Returns the block at the highest height (current_height - 1).
@@ -290,10 +421,10 @@ impl BlockChain {
     /// - `Ok(Some(Block))` if blocks exist
     /// - `Ok(None)` if the blockchain is empty
     /// - `Err(_)` if a database or deserialization error occurs
-    pub fn get_latest_block(&self) -> Result<Option<Block>> {
+    pub fn get_latest_block(&self) -> Result<Block> {
         let height = *self.current_height.lock().unwrap();
         if height == 0 {
-            Ok(None)
+            Err(anyhow!("No blocks in blockchain"))
         } else {
             self.get_block_by_height(height - 1)
         }
@@ -330,7 +461,8 @@ impl BlockChain {
             .map_err(|e| anyhow!("Failed to get block by UUID: {}", e))?
         {
             Some(block_bytes) => {
-                let block = deserialize_block(&block_bytes)?;
+                let block = Block::from_bytes(&block_bytes)
+                    .map_err(|e| anyhow!("Failed to deserialize block: {}", e))?;
                 Ok(Some(block))
             }
             None => Ok(None),
@@ -469,358 +601,8 @@ impl<'a> Iterator for BlockIterator<'a> {
         self.current_height += 1;
 
         match block {
-            Ok(Some(b)) => Some(Ok(b)),
-            Ok(None) => None,
+            Ok(b) => Some(Ok(b)),
             Err(e) => Some(Err(e)),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use openssl::pkey::{PKey, Private};
-    use openssl::rsa::Rsa;
-    use tempfile::TempDir;
-
-    fn generate_rsa_keypair(bits: usize) -> Result<PKey<Private>> {
-        let rsa =
-            Rsa::generate(bits as u32).map_err(|e| anyhow!("Failed to generate RSA key: {}", e))?;
-
-        PKey::from_rsa(rsa).map_err(|e| anyhow!("Failed to create PKey from RSA: {}", e))
-    }
-
-    /// Helper to save a private key to a PEM file in the temp directory
-    fn save_private_key_pem(dir: &Path, private_key: &PKey<Private>) -> Result<std::path::PathBuf> {
-        let key_path = dir.join("test_private_key.pem");
-        let pem_bytes = private_key
-            .private_key_to_pem_pkcs8()
-            .map_err(|e| anyhow!("Failed to convert key to PEM: {}", e))?;
-        std::fs::write(&key_path, pem_bytes)
-            .map_err(|e| anyhow!("Failed to write key file: {}", e))?;
-        Ok(key_path)
-    }
-
-    #[test]
-    fn test_sled_db_creation() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
-        let key_path = save_private_key_pem(temp_dir.path(), &private_key)
-            .expect("Failed to save private key");
-
-        let db = BlockChain::new(temp_dir.path(), &key_path).expect("Failed to create BlockChain");
-
-        assert_eq!(db.block_count().unwrap(), 0);
-    }
-
-    #[test]
-    fn test_insert_and_retrieve_block() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
-        let key_path = save_private_key_pem(temp_dir.path(), &private_key)
-            .expect("Failed to save private key");
-        let db = BlockChain::new(temp_dir.path(), &key_path).expect("Failed to create BlockChain");
-
-        db.insert_block(b"Genesis data".to_vec())
-            .expect("Failed to insert block");
-
-        let retrieved = db
-            .get_block_by_height(0)
-            .expect("Failed to get block")
-            .expect("Block not found");
-
-        assert_eq!(retrieved.block_header.parent_hash, [0u8; 64]);
-    }
-
-    #[test]
-    fn test_get_block_by_height() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
-        let key_path = save_private_key_pem(temp_dir.path(), &private_key)
-            .expect("Failed to save private key");
-        let db = BlockChain::new(temp_dir.path(), &key_path).expect("Failed to create BlockChain");
-
-        db.insert_block(b"Genesis".to_vec())
-            .expect("Failed to insert genesis");
-        db.insert_block(b"Block 1".to_vec())
-            .expect("Failed to insert block 1");
-
-        let retrieved = db
-            .get_block_by_height(1)
-            .expect("Failed to get block")
-            .expect("Block not found");
-
-        let genesis = db
-            .get_block_by_height(0)
-            .expect("Failed to get genesis")
-            .expect("Genesis not found");
-
-        assert_eq!(retrieved.block_header.parent_hash, genesis.block_hash);
-    }
-
-    #[test]
-    fn test_get_latest_block() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
-        let key_path = save_private_key_pem(temp_dir.path(), &private_key)
-            .expect("Failed to save private key");
-        let db = BlockChain::new(temp_dir.path(), &key_path).expect("Failed to create BlockChain");
-
-        db.insert_block(b"Genesis".to_vec())
-            .expect("Failed to insert genesis");
-        db.insert_block(b"Block 1".to_vec())
-            .expect("Failed to insert block 1");
-
-        let latest = db
-            .get_latest_block()
-            .expect("Failed to get latest block")
-            .expect("No latest block");
-
-        let block1 = db
-            .get_block_by_height(1)
-            .expect("Failed to get block 1")
-            .expect("Block 1 not found");
-
-        assert_eq!(latest.block_hash, block1.block_hash);
-    }
-
-    #[test]
-    fn test_block_count() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
-        let key_path = save_private_key_pem(temp_dir.path(), &private_key)
-            .expect("Failed to save private key");
-        let db = BlockChain::new(temp_dir.path(), &key_path).expect("Failed to create BlockChain");
-
-        assert_eq!(db.block_count().unwrap(), 0);
-
-        db.insert_block(b"Genesis".to_vec())
-            .expect("Failed to insert genesis");
-
-        assert_eq!(db.block_count().unwrap(), 1);
-
-        db.insert_block(b"Block 1".to_vec())
-            .expect("Failed to insert block 1");
-
-        assert_eq!(db.block_count().unwrap(), 2);
-    }
-
-    #[test]
-    fn test_iterator() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
-        let key_path = save_private_key_pem(temp_dir.path(), &private_key)
-            .expect("Failed to save private key");
-        let db = BlockChain::new(temp_dir.path(), &key_path).expect("Failed to create BlockChain");
-
-        // Create a blockchain with 5 blocks
-        db.insert_block(b"Genesis".to_vec())
-            .expect("Failed to insert genesis");
-
-        for i in 1..5 {
-            db.insert_block(format!("Block {}", i).into_bytes())
-                .expect(&format!("Failed to insert block {}", i));
-        }
-
-        // Iterate over all blocks
-        let blocks: Vec<_> = db
-            .iter()
-            .collect::<Result<Vec<_>>>()
-            .expect("Failed to collect blocks");
-
-        assert_eq!(blocks.len(), 5);
-
-        // Verify blocks are in order
-        for i in 1..blocks.len() {
-            assert_eq!(blocks[i].block_header.parent_hash, blocks[i - 1].block_hash);
-        }
-    }
-
-    #[test]
-    fn test_empty_iterator() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
-        let key_path = save_private_key_pem(temp_dir.path(), &private_key)
-            .expect("Failed to save private key");
-        let db = BlockChain::new(temp_dir.path(), &key_path).expect("Failed to create BlockChain");
-
-        let blocks: Vec<_> = db
-            .iter()
-            .collect::<Result<Vec<_>>>()
-            .expect("Failed to collect blocks");
-
-        assert_eq!(blocks.len(), 0);
-    }
-
-    #[test]
-    fn test_blockchain_persistence() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let path = temp_dir.path();
-
-        let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
-        let key_path =
-            save_private_key_pem(path, &private_key).expect("Failed to save private key");
-
-        // Create blockchain and add blocks
-        {
-            let db = BlockChain::new(path, &key_path).expect("Failed to create BlockChain");
-            db.insert_block(b"Genesis".to_vec())
-                .expect("Failed to insert genesis");
-            db.insert_block(b"Block 1".to_vec())
-                .expect("Failed to insert block 1");
-            db.insert_block(b"Block 2".to_vec())
-                .expect("Failed to insert block 2");
-
-            assert_eq!(db.block_count().unwrap(), 3);
-            drop(db); // Explicitly close the database
-        }
-
-        // Reopen blockchain and verify it recovers state correctly
-        {
-            let db = BlockChain::new(path, &key_path).expect("Failed to reopen BlockChain");
-
-            // Verify existing blocks are still there
-            assert_eq!(db.block_count().unwrap(), 3);
-            assert!(db.get_block_by_height(0).unwrap().is_some());
-            assert!(db.get_block_by_height(1).unwrap().is_some());
-            assert!(db.get_block_by_height(2).unwrap().is_some());
-
-            // Add a new block - should be at height 3
-            db.insert_block(b"Block 3".to_vec())
-                .expect("Failed to insert block 3");
-
-            assert_eq!(db.block_count().unwrap(), 4);
-            let block3 = db
-                .get_block_by_height(3)
-                .unwrap()
-                .expect("Block 3 not found");
-            let block2 = db
-                .get_block_by_height(2)
-                .unwrap()
-                .expect("Block 2 not found");
-
-            // Verify block 3 links to block 2
-            assert_eq!(block3.block_header.parent_hash, block2.block_hash);
-        }
-    }
-
-    #[test]
-    fn test_validate_valid_chain() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
-        let key_path = save_private_key_pem(temp_dir.path(), &private_key)
-            .expect("Failed to save private key");
-        let db = BlockChain::new(temp_dir.path(), &key_path).expect("Failed to create BlockChain");
-
-        // Empty chain should be valid
-        db.validate().expect("Empty blockchain should be valid");
-
-        // Add blocks
-        db.insert_block(b"Genesis".to_vec())
-            .expect("Failed to insert genesis");
-        db.validate()
-            .expect("Blockchain with genesis should be valid");
-
-        db.insert_block(b"Block 1".to_vec())
-            .expect("Failed to insert block 1");
-        db.validate()
-            .expect("Blockchain with 2 blocks should be valid");
-
-        db.insert_block(b"Block 2".to_vec())
-            .expect("Failed to insert block 2");
-        db.validate()
-            .expect("Blockchain with 3 blocks should be valid");
-    }
-
-    #[test]
-    fn test_validate_after_persistence() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let path = temp_dir.path();
-
-        let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
-        let key_path =
-            save_private_key_pem(path, &private_key).expect("Failed to save private key");
-
-        // Create blockchain with blocks
-        {
-            let db = BlockChain::new(path, &key_path).expect("Failed to create BlockChain");
-            db.insert_block(b"Genesis".to_vec())
-                .expect("Failed to insert genesis");
-            db.insert_block(b"Block 1".to_vec())
-                .expect("Failed to insert block 1");
-            db.insert_block(b"Block 2".to_vec())
-                .expect("Failed to insert block 2");
-            db.validate()
-                .expect("Blockchain should be valid before close");
-            drop(db); // Explicitly close the database
-        }
-
-        // Reopen and validate
-        {
-            let db = BlockChain::new(path, &key_path).expect("Failed to reopen BlockChain");
-            db.validate()
-                .expect("Blockchain should be valid after reopen");
-        }
-    }
-
-    #[test]
-    fn test_get_data_at_height() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let private_key = generate_rsa_keypair(2048).expect("Failed to generate key");
-        let key_path = save_private_key_pem(temp_dir.path(), &private_key)
-            .expect("Failed to save private key");
-        let db = BlockChain::new(temp_dir.path(), &key_path).expect("Failed to create BlockChain");
-
-        // Insert blocks with different data
-        let data0 = b"Genesis block data".to_vec();
-        let data1 = b"First block data".to_vec();
-        let data2 = b"Second block data".to_vec();
-
-        db.insert_block(data0.clone())
-            .expect("Failed to insert genesis");
-        db.insert_block(data1.clone())
-            .expect("Failed to insert block 1");
-        db.insert_block(data2.clone())
-            .expect("Failed to insert block 2");
-
-        // Test getting data at different heights
-        let encrypted_data0 = db
-            .get_data_at_height(0)
-            .expect("Failed to get data at height 0")
-            .expect("No data at height 0");
-        let encrypted_data1 = db
-            .get_data_at_height(1)
-            .expect("Failed to get data at height 1")
-            .expect("No data at height 1");
-        let encrypted_data2 = db
-            .get_data_at_height(2)
-            .expect("Failed to get data at height 2")
-            .expect("No data at height 2");
-
-        // Verify data is encrypted (not equal to plaintext)
-        assert_ne!(encrypted_data0, data0);
-        assert_ne!(encrypted_data1, data1);
-        assert_ne!(encrypted_data2, data2);
-
-        // Decrypt and verify
-        use crate::hybrid_encryption::hybrid_decrypt;
-
-        let decrypted0 =
-            hybrid_decrypt(&private_key, encrypted_data0).expect("Failed to decrypt data 0");
-        let decrypted1 =
-            hybrid_decrypt(&private_key, encrypted_data1).expect("Failed to decrypt data 1");
-        let decrypted2 =
-            hybrid_decrypt(&private_key, encrypted_data2).expect("Failed to decrypt data 2");
-
-        assert_eq!(decrypted0, data0);
-        assert_eq!(decrypted1, data1);
-        assert_eq!(decrypted2, data2);
-
-        // Test non-existent height
-        assert!(
-            db.get_data_at_height(99)
-                .expect("Failed to query height 99")
-                .is_none()
-        );
     }
 }

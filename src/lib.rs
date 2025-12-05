@@ -56,11 +56,9 @@
 //! - **Thread-safe**: Mutex-protected height counter for concurrent access
 //!
 
-pub mod app_key_store;
 pub mod block;
 pub mod blockchain;
 pub mod db_model;
-pub mod hybrid_encryption;
 
 // Re-export uuid for convenience
 pub use uuid;

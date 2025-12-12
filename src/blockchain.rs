@@ -701,7 +701,7 @@ pub struct BlockIterator<'a> {
     /// Reference to the blockchain database
     db: &'a BlockChain,
     /// Current position in the iteration
-    current_height: u64,
+    pub current_height: u64,
     /// Maximum height to iterate to (inclusive)
     max_height: u64,
 }

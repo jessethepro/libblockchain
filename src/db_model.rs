@@ -346,14 +346,9 @@ impl RocksDbModel {
         } else if self.column_families.is_empty() {
             rocksdb::DB::open(&opts, &self.path)
         } else {
-            // Try to open with existing column families, or create them
-            match rocksdb::DB::open_cf(&opts, &self.path, &self.column_families) {
-                Ok(db) => Ok(db),
-                Err(_) => {
-                    // Database might not exist yet, create it
-                    rocksdb::DB::open_cf(&opts, &self.path, &self.column_families)
-                }
-            }
+            // Enable automatic creation of missing column families
+            opts.create_missing_column_families(true);
+            rocksdb::DB::open_cf(&opts, &self.path, &self.column_families)
         }
     }
 

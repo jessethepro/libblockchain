@@ -1,17 +1,17 @@
 # libblockchain
 
-A generic, lightweight Rust library for creating and managing blockchain blocks with persistent storage. This library provides core block structures, cryptographic primitives, and SledDB-backed persistence while remaining agnostic to the actual data you store in blocks. To create or open a blockchain, the library requires the path to a Openssl RSA Private Key in PEM format. On Linux, I use the openssl command to generate a 4096 bit application key. The library will prompt the user for the password on the command line. The RSA Private Key file contains both the Private and Public keys and is used to encrypt/decrypt AES Keys. Unique AES GCM 256 bit keys are generated for each block transaction. Once the RSA Private Key file is loaded at application start, it can be removed from the file system and returned to its secure offline storage.
+A generic, lightweight Rust library for creating and managing blockchain blocks with persistent storage. This library provides core block structures, cryptographic primitives, and RocksDB-backed persistence while remaining agnostic to the actual data you store in blocks. To create or open a blockchain, the library requires the path to a Openssl RSA Private Key in PEM format. On Linux, I use the openssl command to generate a 4096 bit application key. The library will prompt the user for the password on the command line. The RSA Private Key file contains both the Private and Public keys and is used to encrypt/decrypt AES Keys. Unique AES GCM 256 bit keys are generated for each block transaction. Once the RSA Private Key file is loaded at application start, it can be removed from the file system and returned to its secure offline storage.
 
 ## Features
 
 - **Data-agnostic**: Store any application-specific data in blocks (JSON, binary, custom formats)
-- **Persistent storage**: Built-in SledDB integration for blockchain persistence
+- **Persistent storage**: Built-in RocksDB integration for blockchain persistence
 - **Automatic height management**: Heights assigned automatically with thread-safe Mutex protection
 - **Hybrid encryption**: RSA + AES-256-GCM encryption for block data
 - **Secure key storage**: Private keys protected with `secrecy` crate, auto-extracts public keys
 - **UUID-based indexing**: Efficient block lookup by UUID or height
 - **Iterator support**: Traverse blocks in chain order
-- **Configurable database**: Multiple SledDB presets (high performance, high durability, temporary, read-only)
+- **Configurable database**: Multiple RocksDB presets (high performance, high durability, read-only)
 - **Type-safe**: Strong typing with clear separation between cryptographic and metadata concerns
 - **SHA-512 hashing**: 64-byte cryptographic hashes for block integrity
 
@@ -58,7 +58,7 @@ chain.validate()?;
 ```
 
 ## Architecture
-- **`blockchain`**: Persistent blockchain storage with SledDB
+- **`blockchain`**: Persistent blockchain storage with RocksDB
   - Automatic height management with Mutex-protected counter
   - UUID-based block storage with separate height index
   - Iterator support for traversing blocks in order
@@ -66,17 +66,19 @@ chain.validate()?;
   - Private keys protected using `secrecy` crate with automatic zeroing
   - Automatic public key extraction from private keys
   - Interactive password prompting for encrypted private keys
+  - Thread-safe with Arc-wrapped database
 - **`block`**: Core block structures
   - Block and BlockHeader with SHA-512 hashing
   - UUID-based block identification
   - Serialization/deserialization support
-- **`db_model`**: SledDB configuration and presets
-  - High performance, high durability, temporary, and read-only configurations
+- **`db_model`**: RocksDB configuration and presets
+  - High performance, high durability, and read-only configurations
   - Builder pattern for custom settings
+  - Column families for organizing data
 
 ### Database Structure
 
-The blockchain uses two SledDB trees:
+The blockchain uses two RocksDB column families:
 - **`blocks`**: Maps block UUID (16 bytes) → serialized Block data
 - **`height`**: Maps block height (u64 as big-endian bytes) → block UUID
 

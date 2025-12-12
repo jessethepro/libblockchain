@@ -1,75 +1,148 @@
 # Copilot Instructions for libblockchain
 
 ## Project Overview
-This is a **generic blockchain library** for creating and managing blockchain blocks. The actual data stored in `block_data` is application-specific and will be defined by consumer projects. This library provides the core block structure, hashing, and chain integrity primitives.
+A **generic, data-agnostic blockchain library** with persistent storage, hybrid encryption, and secure key management. The library provides infrastructure for blockchain operations while remaining agnostic to payload content. Applications define what data goes in `block_data: Vec<u8>`.
+
+**Recent Activity**: Successfully migrated from SledDB to RocksDB (December 2025).
 
 ## Architecture
 
 ### Core Components
-- **`src/block.rs`**: Defines `Block` and `BlockHeader` structures
-  - `BlockHeader`: Contains cryptographically relevant data (version, parent_hash, timestamp, nonce)
-  - `Block`: Represents a complete block with header, hash, data payload, and signature
-  - Block height is intentionally **database metadata**, not part of the header structure
+- **[src/block.rs](src/block.rs)**: Block structures with SHA-512 hashing (64-byte hashes)
+  - `BlockHeader`: Cryptographic data (UUID, version, parent_hash, timestamp, nonce) - 100 bytes fixed
+  - `Block`: Complete block with header, hash, and encrypted data payload
+  - Block height is **NOT in the header** - managed automatically by `BlockChain` as database metadata
+  - Uses `openssl::hash::hash(MessageDigest::sha512(), ...)` for block hashing
+
+- **[src/blockchain.rs](src/blockchain.rs)**: RocksDB-backed persistent storage with integrated encryption
+  - Two RocksDB column families: `blocks` (UUID → block), `height` (u64 → UUID)
+  - Mutex-protected `current_height` counter for thread-safe concurrent inserts
+  - Database wrapped in `Arc<DB>` for thread-safe sharing
+  - **Hybrid encryption**: AES-256-GCM for block data, RSA-OAEP for key encapsulation
+  - Private keys wrapped in `SecretBox<SecurePrivateKey>` (implements `Zeroize`)
+  - Interactive password prompting for encrypted PEM files via `rpassword`
+  - Public key automatically extracted from private key on initialization
+  - Storage format: `[key_len(4)] || [RSA(AES_key)(var)] || [nonce(12)] || [tag(16)] || [block_len(4)] || [AES(Block)(var)]`
+
+- **[src/db_model.rs](src/db_model.rs)**: RocksDB configuration with presets
+  - Presets: `high_performance()`, `high_durability()`, `read_only()`
+  - Builder pattern: `.with_block_cache_size()`, `.with_compression()`, `.with_sync_writes()`
+  - Default: 512MB block cache, 64MB write buffer, LZ4 compression
+  - Column families (tables): configure with `.with_column_family()`
 
 ### Key Design Decisions
-- **Data-agnostic**: `block_data: Vec<u8>` is opaque to this library - consumer projects define the payload
-- **Separation of concerns**: Cryptographic data lives in `BlockHeader`; operational metadata (like height) is external
-- **Hash duplication**: Both `block_hash` and `previous_block_hash` exist in `Block` for convenience, though `previous_block_hash` duplicates `block_header.parent_hash`
+- **Data-agnostic**: `block_data: Vec<u8>` - applications define the payload structure
+- **UUID-based storage**: Blocks stored by UUID (16 bytes) with separate height column family for sequential access
+- **Automatic height management**: Heights assigned on `put_block()`, incremented atomically
+- **Transparent encryption**: Encrypt on write, decrypt on read - users see plaintext `block_data`
+- **Security by default**: All block data encrypted with unique AES-256-GCM keys per block
+- **Column families**: RocksDB's equivalent of "tables" - accessed via `cf_handle()`
+- **External dependencies**: 
+  - `libcertcrypto` (path dependency: `../libcertcrypto`) - verify if still used
+  - `rocksdb` with `mt_static` feature for multi-threaded static linking
 
-## Code Conventions
+## Data Types & Constants
 
-### Data Types
-- Use `[u8; 32]` for all hash values (256-bit hashes)
-- Use `Vec<u8>` for variable-length data (signatures, block payloads)
-- Unix timestamps are `u64` (seconds since epoch)
+```rust
+// Block structure (src/block.rs)
+const BLOCK_VERSION: u32 = 1;
+const BLOCK_UID_SIZE: usize = 16;        // UUID bytes
+const BLOCK_HASH_SIZE: usize = 64;       // SHA-512 hash
+const BLOCK_HEADER_SIZE: usize = 100;    // uid(16) + version(4) + parent(64) + time(8) + nonce(8)
 
-### Module References (Currently Incomplete)
-The codebase references modules that don't exist yet:
-- `crate::blockchain::{H256, Signature}` - type aliases expected
-- `crate::crypto::certificate::CertificateForBlockchain` - will be removed (certificate-specific, not generic)
-
-### Dependencies
-Current `Cargo.toml` is minimal. Expected dependencies based on code:
-- `serde` + `serde_derive` - serialization
-- `chrono` - timestamp handling  
-- `rand` - nonce generation
+// Encryption (src/blockchain.rs)
+const AES_GCM_256_KEY_SIZE: usize = 32;  // 256-bit AES key
+const AES_GCM_NONCE_SIZE: usize = 12;    // 96-bit nonce
+const AES_GCM_TAG_SIZE: usize = 16;      // 128-bit auth tag
+```
 
 ## Development Workflow
 
 ### Build & Test
 ```bash
-cargo build          # Compile library
-cargo test           # Run tests
-cargo check          # Fast compilation check
-cargo doc --open     # Generate and view documentation
+cargo build                    # Compile library
+cargo test                     # Run unit tests (db_model tests exist)
+cargo doc --open               # View documentation
+cargo check                    # Fast type checking
 ```
 
-### Code Organization
-- Keep library code in `src/lib.rs` minimal - re-export main types
-- Each major concept gets its own module file (block, chain, crypto, etc.)
-- Use `//!` module-level docs to explain the "why" behind design choices
+### Testing Private Key Encryption
+The library prompts for passwords at runtime. To test:
+```bash
+# Generate test RSA key (4096-bit recommended)
+openssl genrsa -aes256 -out test_key.pem 4096
 
-## When Adding Features
+# Or unencrypted for testing
+openssl genrsa -out test_key_nopass.pem 4096
+```
 
-### For New Block Types or Fields
-- Add fields to `BlockHeader` only if they're cryptographically relevant (affect hash)
-- Add to `Block` if they're metadata or derived values
-- Update `BLOCK_VERSION` constant if making breaking changes to header structure
+### Database Inspection
+```rust
+// RocksDB data stored at: <path> directory
+// Use RocksDB tools or rust code to inspect:
+use rocksdb::{DB, IteratorMode};
+let db = DB::open_cf(&opts, "./my_blockchain", &["blocks", "height"])?;
+let blocks_cf = db.cf_handle("blocks").unwrap();
+let height_cf = db.cf_handle("height").unwrap();
+```
 
-### For Cryptographic Operations
-- **Hashing**: Use the `BlockHasher` trait (defined in `src/traits.rs`) for all hash operations
-  - Consumers implement this trait with their chosen algorithm (SHA-256, BLAKE3, etc.)
-  - Returns `Vec<u8>` to support variable-length hashes
-  - Hash calculations should include serialized `BlockHeader` + `block_data`
-- **Signatures**: Verification is the consumer's responsibility (they know the signature scheme)
-- All cryptographic primitives should be generic/configurable through traits
+## Code Conventions
 
-### Testing Strategy
-- Unit tests for each block component (header creation, serialization)
-- Property tests for hash chain integrity
-- Example integration showing how consumers would use the library
+### Serialization Format
+```rust
+// BlockHeader (100 bytes): uid(16) || version(4) || parent_hash(64) || timestamp(8) || nonce(8)
+// Block: header(100) || block_hash(64) || data_len(4) || block_data(var)
+// Stored (encrypted): key_len(4) || RSA(AES_key)(var) || nonce(12) || tag(16) || block_len(4) || AES(Block)(var)
+```
+
+### Error Handling
+- Use `anyhow::Result<T>` for all fallible operations
+- Add context with `.context("Description")` or `.with_context(|| format!("..."))`
+- Database operations should flush after inserts to ensure durability
+- Crypto errors propagate through `anyhow` with descriptive context
+
+### When Adding Features
+
+**Adding Block Fields:**
+- Add to `BlockHeader` ONLY if cryptographically relevant (affects hash)
+- Update `BLOCK_VERSION` constant for breaking changes
+- Update `BlockHeader::bytes()` and `::new_from_bytes()` serialization
+- Adjust `BLOCK_HEADER_SIZE` constant if size changes
+
+**Cryptographic Changes:**
+- SHA-512 hardcoded in `BlockHeader::new()` and `::generate_block_hash()`
+- AES-256-GCM cipher fixed in `BlockChain::put_block()` and `::get_block_by_height()`
+- RSA-OAEP with SHA-256 MGF1 for key encapsulation (see `hybrid_encrypt()`/`hybrid_decrypt()`)
+- To make pluggable: extract to trait or strategy pattern
+
+**Database Changes:**
+- RocksDB configuration in [src/db_model.rs](src/db_model.rs) - use presets not raw `rocksdb::Options`
+- Column families must be specified at database open time
+- All operations require `cf_handle()` lookup for the target column family
+- Use `Arc<DB>` wrapper for thread-safe database sharing
+
+## Security Considerations
+- **Private keys never logged**: `SecurePrivateKey` implements `Debug` as `<redacted>`
+- **Memory zeroing**: Private key DER bytes zeroed on drop via `Zeroize` trait
+- **Password input**: Uses `rpassword` to avoid echoing passwords to terminal
+- **Key encapsulation**: Each block gets unique AES key, RSA-OAEP encrypts the AES key
+- **Authenticated encryption**: AES-GCM provides both confidentiality and integrity (AEAD)
 
 ## Common Pitfalls
-- Don't assume specific data formats in `block_data` - keep it generic
-- Don't hardcode cryptographic algorithms - allow consumer configuration
-- Remember: block height is NOT in the header (stored externally in database)
+- **Don't access `block_data` before decryption**: `BlockChain` methods handle encryption/decryption transparently
+- **Don't store height in `BlockHeader`**: Height is database metadata managed by `current_height` Mutex, NOT part of block structure
+- **Don't call `Block::bytes()` on encrypted blocks**: Hashing happens in `BlockHeader` before encryption
+- **Parent hash validation**: Genesis block has `parent_hash = [0u8; 64]`, not empty slice or Option
+- **Thread safety**: Database already wrapped in `Arc<DB>`, `current_height` is Mutex-protected
+- **Column family handles**: Always check `cf_handle()` returns `Some` before using - panic if None
+- **Iterator sizing**: RocksDB iterators return `Box<[u8]>`, not `&[u8]` - copy to fixed-size arrays
+- **Path dependencies**: `libcertcrypto = { path = "../libcertcrypto" }` - verify location exists or remove if unused
+- **Edition 2024**: Cargo.toml uses `edition = "2024"` which may not be stable on all toolchains
+
+## Incomplete/Future Work
+- **No integration tests**: `tests/` directory exists but is empty - no tests in blockchain.rs
+- **No consensus mechanism**: PoW/PoS not implemented - nonce field exists in BlockHeader but unused
+- **No network layer**: Purely local storage, no P2P or synchronization
+- **No block validation hooks**: Applications can't inject custom validation rules
+- **Iterator limitations**: No reverse iteration, filtering, or seeking to specific heights
+- **SledDB removed**: Migration to RocksDB complete, but no backward compatibility with Sled databases

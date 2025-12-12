@@ -1,13 +1,13 @@
-//! Blockchain storage and management using SledDB
+//! Blockchain storage and management using RocksDB
 //!
-//! This module provides persistent storage for blockchain blocks using Sled,
+//! This module provides persistent storage for blockchain blocks using RocksDB,
 //! a high-performance embedded database. The blockchain automatically manages
 //! block heights and parent relationships, storing blocks by UUID with a
 //! separate height index for efficient retrieval.
 //!
 //! # Database Structure
 //!
-//! The blockchain uses two SledDB trees:
+//! The blockchain uses two RocksDB column families:
 //! - `blocks`: Maps block UUID (16 bytes) to serialized Block data
 //! - `height`: Maps block height (u64 as big-endian bytes) to block UUID
 //!
@@ -17,11 +17,12 @@
 //! concurrent access. This represents the next height to be assigned.
 
 use crate::block::{BLOCK_HASH_SIZE, BLOCK_UID_SIZE, Block};
-use crate::db_model::SledDb;
+use crate::db_model::RocksDbModel;
 use anyhow::{Context, Result, anyhow};
 use openssl::pkey::PKey;
 use openssl::rsa::Padding;
 use openssl::symm::Cipher;
+use rocksdb::{DB, IteratorMode};
 use secrecy::{ExposeSecret, SecretBox, zeroize::Zeroize};
 use std::fmt;
 use std::path::Path;
@@ -64,16 +65,8 @@ impl fmt::Debug for SecurePrivateKey {
     }
 }
 pub struct BlockChain {
-    /// Sled database instance
-    db: sled::Db,
-
-    /// Tree for storing blocks by UUID
-    /// Key: block UUID (16 bytes), Value: serialized Block
-    blocks: sled::Tree,
-
-    /// Tree for storing height -> UUID mapping
-    /// Key: block height (u64 as big-endian bytes), Value: block UUID (16 bytes)
-    height_index: sled::Tree,
+    /// RocksDB database instance
+    db: std::sync::Arc<DB>,
 
     /// Next height to be assigned (protected by Mutex for thread safety)
     /// When inserting a new block, it will be assigned this height,
@@ -108,31 +101,30 @@ impl BlockChain {
     /// - The height index cannot be read
     /// - The private key cannot be loaded
     pub fn new<P: AsRef<Path>>(path: P, private_key_path: P) -> Result<Self> {
-        let db = SledDb::new(path.as_ref().to_path_buf())
+        let db = RocksDbModel::new(path.as_ref().to_path_buf())
+            .with_column_family("blocks")
+            .with_column_family("height")
             .open()
-            .map_err(|e| anyhow!("Failed to open SledDB: {}", e))?;
+            .map_err(|e| anyhow!("Failed to open RocksDB: {}", e))?;
 
-        // blocks tree. Key: block uuid (UUID v4), Value: serialized Block
-        let blocks = db
-            .open_tree("blocks")
-            .map_err(|e| anyhow!("Failed to open blocks tree: {}", e))?;
-        // height_index tree. Key: block height (u64 as bytes), Value: block uuid (UUID v4)
-        let height_index = db
-            .open_tree("height")
-            .map_err(|e| anyhow!("Failed to open height_index tree: {}", e))?;
+        let db = std::sync::Arc::new(db);
 
         // Get the next height to assign based on the highest block in the database
-        let next_height = match height_index
-            .last()
-            .map_err(|e| anyhow!("Failed to get last height: {}", e))?
-        {
-            Some((height_bytes, _block_uuid)) => {
-                let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(&height_bytes);
-                // Last block is at this height, so next block should be height + 1
-                u64::from_be_bytes(bytes) + 1
+        let height_cf = db
+            .cf_handle("height")
+            .ok_or_else(|| anyhow!("Failed to get height column family"))?;
+
+        let next_height = {
+            let mut iter = db.iterator_cf(height_cf, IteratorMode::End);
+            match iter.next() {
+                Some(Ok((height_bytes, _block_uuid))) => {
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&height_bytes);
+                    // Last block is at this height, so next block should be height + 1
+                    u64::from_be_bytes(bytes) + 1
+                }
+                _ => 0, // Empty blockchain, start at height 0
             }
-            None => 0, // Empty blockchain, start at height 0
         };
 
         // Load private key from PEM file
@@ -174,8 +166,6 @@ impl BlockChain {
 
         Ok(Self {
             db,
-            blocks,
-            height_index,
             current_height: Mutex::new(next_height),
             private_key: SecretBox::new(Box::new(SecurePrivateKey {
                 der_bytes: private_key_der,
@@ -280,14 +270,22 @@ impl BlockChain {
         })()?;
 
         // Store block by UUID
-        self.blocks
-            .insert(uuid, stored_block_bytes)
+        let blocks_cf = self
+            .db
+            .cf_handle("blocks")
+            .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
+        self.db
+            .put_cf(blocks_cf, uuid, &stored_block_bytes)
             .map_err(|e| anyhow!("Failed to insert block: {}", e))?;
 
         // Store height -> UUID mapping
         let height_bytes = height.to_be_bytes();
-        self.height_index
-            .insert(height_bytes, &block.block_header.block_uid)
+        let height_cf = self
+            .db
+            .cf_handle("height")
+            .ok_or_else(|| anyhow!("Failed to get height column family"))?;
+        self.db
+            .put_cf(height_cf, &height_bytes, &block.block_header.block_uid)
             .map_err(|e| anyhow!("Failed to insert height index: {}", e))?;
 
         // Increment height for next block
@@ -312,21 +310,36 @@ impl BlockChain {
     /// - `Err(_)` if a database or deserialization error occurs
     pub fn get_block_by_height(&self, height: u64) -> Result<Block> {
         let height_bytes = height.to_be_bytes();
+        let height_cf = self
+            .db
+            .cf_handle("height")
+            .ok_or_else(|| anyhow!("Failed to get height column family"))?;
+
         let stored_block = match self
-            .height_index
-            .get(height_bytes)
+            .db
+            .get_cf(height_cf, &height_bytes)
             .map_err(|e| anyhow!("Failed to get block UUID by height: {}", e))?
         {
             Some(uuid_bytes) => {
                 let mut uuid = [0u8; 16];
                 uuid.copy_from_slice(&uuid_bytes);
+                let blocks_cf = self
+                    .db
+                    .cf_handle("blocks")
+                    .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
+
                 match self
-                    .blocks
-                    .get(&uuid)
+                    .db
+                    .get_cf(blocks_cf, &uuid)
                     .map_err(|e| anyhow!("Failed to get block by UUID: {}", e))?
                 {
                     Some(block_bytes) => block_bytes,
-                    None => return Err(anyhow!("Block UUID {:?} not found in blocks tree", uuid)),
+                    None => {
+                        return Err(anyhow!(
+                            "Block UUID {:?} not found in blocks column family",
+                            uuid
+                        ));
+                    }
                 }
             }
             None => return Err(anyhow!("No block found at height {}", height)),
@@ -334,12 +347,43 @@ impl BlockChain {
         let block = (|| -> Result<Block> {
             // Deserialize block from bytes
             let mut index: usize = 0;
+
+            // Validate minimum size
+            if stored_block.len() < AES_KEY_LEN_SIZE {
+                return Err(anyhow!(
+                    "Stored block too small: {} bytes (need at least {})",
+                    stored_block.len(),
+                    AES_KEY_LEN_SIZE
+                ));
+            }
+
             let aes_key_len =
                 u32::from_le_bytes(stored_block[index..AES_KEY_LEN_SIZE].try_into().unwrap())
                     as usize;
             index += AES_KEY_LEN_SIZE;
+
+            // Validate we have enough data for encrypted AES key
+            if stored_block.len() < index + aes_key_len {
+                return Err(anyhow!(
+                    "Not enough data for encrypted AES key: need {} bytes at offset {}, have {} total",
+                    aes_key_len,
+                    index,
+                    stored_block.len()
+                ));
+            }
+
             let encrypted_aes_key = &stored_block[index..index + aes_key_len];
             index += aes_key_len;
+
+            // Validate we have enough data for nonce and tag
+            if stored_block.len() < index + AES_GCM_NONCE_SIZE + AES_GCM_TAG_SIZE + BLOCK_LEN_SIZE {
+                return Err(anyhow!(
+                    "Not enough data for nonce, tag, and block length at offset {}, have {} total",
+                    index,
+                    stored_block.len()
+                ));
+            }
+
             let nonce = &stored_block[index..index + AES_GCM_NONCE_SIZE];
             index += AES_GCM_NONCE_SIZE;
             let tag = &stored_block[index..index + AES_GCM_TAG_SIZE];
@@ -350,9 +394,26 @@ impl BlockChain {
                     .unwrap(),
             ) as usize;
             index += BLOCK_LEN_SIZE;
+
+            // Validate we have enough data for the serialized block
+            if stored_block.len() < index + block_len {
+                return Err(anyhow!(
+                    "Not enough data for serialized block: need {} bytes at offset {}, have {} total",
+                    block_len,
+                    index,
+                    stored_block.len()
+                ));
+            }
+
             let block_bytes = &stored_block[index..index + block_len];
-            let mut block = Block::from_bytes(block_bytes)
-                .map_err(|e| anyhow!("Failed to deserialize block: {}", e))?;
+            let mut block = Block::from_bytes(block_bytes).map_err(|e| {
+                anyhow!(
+                    "Failed to deserialize block: {} (block_bytes len: {}, expected in block: {})",
+                    e,
+                    block_bytes.len(),
+                    block_len
+                )
+            })?;
             let decrypted_block_data = {
                 // Decrypt AES key with RSA-OAEP
                 let aes_key = (|| -> Result<Vec<u8>> {
@@ -398,17 +459,19 @@ impl BlockChain {
     /// # Returns
     /// The height of the last block, or 0 for an empty chain
     pub fn get_height(&self) -> Result<u64> {
-        match self
-            .height_index
-            .last()
-            .map_err(|e| anyhow!("Failed to get last height: {}", e))?
-        {
-            Some((height_bytes, _)) => {
+        let height_cf = self
+            .db
+            .cf_handle("height")
+            .ok_or_else(|| anyhow!("Failed to get height column family"))?;
+
+        let mut iter = self.db.iterator_cf(height_cf, IteratorMode::End);
+        match iter.next() {
+            Some(Ok((height_bytes, _))) => {
                 let mut bytes = [0u8; 8];
                 bytes.copy_from_slice(&height_bytes);
                 Ok(u64::from_be_bytes(bytes))
             }
-            None => Ok(0), // Empty blockchain
+            _ => Ok(0), // Empty blockchain
         }
     }
 
@@ -438,9 +501,16 @@ impl BlockChain {
     /// # Returns
     /// `Ok(true)` if the block exists, `Ok(false)` otherwise
     pub fn block_exists(&self, uuid: &[u8; BLOCK_UID_SIZE]) -> Result<bool> {
-        self.blocks
-            .contains_key(uuid)
-            .map_err(|e| anyhow!("Failed to check block existence: {}", e))
+        let blocks_cf = self
+            .db
+            .cf_handle("blocks")
+            .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
+
+        Ok(self
+            .db
+            .get_cf(blocks_cf, uuid)
+            .map_err(|e| anyhow!("Failed to check block existence: {}", e))?
+            .is_some())
     }
 
     /// Retrieve a block by its UUID
@@ -455,9 +525,14 @@ impl BlockChain {
     /// - `Ok(None)` if no block with this UUID exists
     /// - `Err(_)` if a database or deserialization error occurs
     pub fn get_block_by_uuid(&self, uuid: &[u8; BLOCK_UID_SIZE]) -> Result<Option<Block>> {
+        let blocks_cf = self
+            .db
+            .cf_handle("blocks")
+            .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
+
         match self
-            .blocks
-            .get(uuid)
+            .db
+            .get_cf(blocks_cf, uuid)
             .map_err(|e| anyhow!("Failed to get block by UUID: {}", e))?
         {
             Some(block_bytes) => {
@@ -474,7 +549,12 @@ impl BlockChain {
     /// # Returns
     /// The count of blocks in the database
     pub fn block_count(&self) -> Result<usize> {
-        Ok(self.blocks.len())
+        let blocks_cf = self
+            .db
+            .cf_handle("blocks")
+            .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
+        let count = self.db.iterator_cf(blocks_cf, IteratorMode::Start).count();
+        Ok(count)
     }
 
     /// Validate the entire blockchain for integrity

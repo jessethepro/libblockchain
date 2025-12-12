@@ -2,7 +2,7 @@
 //!
 //! This library provides core blockchain primitives including:
 //! - Block structures with SHA-512 cryptographic hashing
-//! - Persistent storage using SledDB
+//! - Persistent storage using RocksDB
 //! - Integrated hybrid RSA-OAEP + AES-256-GCM encryption
 //! - Automatic height and parent relationship management
 //! - Interactive password prompting for encrypted private keys
@@ -21,7 +21,7 @@
 //!
 //! - [`block`]: Block and BlockHeader structures with SHA-512 hashing
 //! - [`blockchain`]: Persistent blockchain storage with integrated encryption
-//! - [`db_model`]: SledDB configuration and presets
+//! - [`db_model`]: RocksDB configuration and presets
 //!
 //! # Example
 //!

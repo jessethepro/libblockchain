@@ -676,14 +676,15 @@ impl BlockChain {
     /// ```
     pub fn iter(&self) -> BlockIterator<'_> {
         let current_height = *self.current_height.lock().unwrap();
-        let max_height = if current_height > 0 {
-            current_height - 1
+        // If blockchain is empty, set current_height > max_height to return None immediately
+        let (start_height, max_height) = if current_height > 0 {
+            (0, current_height - 1)
         } else {
-            0
+            (1, 0) // Empty blockchain: start > max, iterator returns None immediately
         };
         BlockIterator {
             db: self,
-            current_height: 0,
+            current_height: start_height,
             max_height,
         }
     }
@@ -701,7 +702,7 @@ pub struct BlockIterator<'a> {
     /// Reference to the blockchain database
     db: &'a BlockChain,
     /// Current position in the iteration
-    pub current_height: u64,
+    current_height: u64,
     /// Maximum height to iterate to (inclusive)
     max_height: u64,
 }

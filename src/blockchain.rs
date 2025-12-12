@@ -524,24 +524,128 @@ impl BlockChain {
     /// - `Ok(Some(Block))` if the block exists
     /// - `Ok(None)` if no block with this UUID exists
     /// - `Err(_)` if a database or deserialization error occurs
-    pub fn get_block_by_uuid(&self, uuid: &[u8; BLOCK_UID_SIZE]) -> Result<Option<Block>> {
+    pub fn get_block_by_uuid(&self, uuid: &[u8; BLOCK_UID_SIZE]) -> Result<Block> {
         let blocks_cf = self
             .db
             .cf_handle("blocks")
             .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
-
-        match self
+        let stored_block = match self
             .db
-            .get_cf(blocks_cf, uuid)
+            .get_cf(blocks_cf, &uuid)
             .map_err(|e| anyhow!("Failed to get block by UUID: {}", e))?
         {
-            Some(block_bytes) => {
-                let block = Block::from_bytes(&block_bytes)
-                    .map_err(|e| anyhow!("Failed to deserialize block: {}", e))?;
-                Ok(Some(block))
+            Some(block_bytes) => block_bytes,
+            None => {
+                return Err(anyhow!(
+                    "Block UUID {:?} not found in blocks column family",
+                    uuid
+                ));
             }
-            None => Ok(None),
-        }
+        };
+        let block = (|| -> Result<Block> {
+            // Deserialize block from bytes
+            let mut index: usize = 0;
+
+            // Validate minimum size
+            if stored_block.len() < AES_KEY_LEN_SIZE {
+                return Err(anyhow!(
+                    "Stored block too small: {} bytes (need at least {})",
+                    stored_block.len(),
+                    AES_KEY_LEN_SIZE
+                ));
+            }
+
+            let aes_key_len =
+                u32::from_le_bytes(stored_block[index..AES_KEY_LEN_SIZE].try_into().unwrap())
+                    as usize;
+            index += AES_KEY_LEN_SIZE;
+
+            // Validate we have enough data for encrypted AES key
+            if stored_block.len() < index + aes_key_len {
+                return Err(anyhow!(
+                    "Not enough data for encrypted AES key: need {} bytes at offset {}, have {} total",
+                    aes_key_len,
+                    index,
+                    stored_block.len()
+                ));
+            }
+
+            let encrypted_aes_key = &stored_block[index..index + aes_key_len];
+            index += aes_key_len;
+
+            // Validate we have enough data for nonce and tag
+            if stored_block.len() < index + AES_GCM_NONCE_SIZE + AES_GCM_TAG_SIZE + BLOCK_LEN_SIZE {
+                return Err(anyhow!(
+                    "Not enough data for nonce, tag, and block length at offset {}, have {} total",
+                    index,
+                    stored_block.len()
+                ));
+            }
+
+            let nonce = &stored_block[index..index + AES_GCM_NONCE_SIZE];
+            index += AES_GCM_NONCE_SIZE;
+            let tag = &stored_block[index..index + AES_GCM_TAG_SIZE];
+            index += AES_GCM_TAG_SIZE;
+            let block_len = u32::from_le_bytes(
+                stored_block[index..index + BLOCK_LEN_SIZE]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            index += BLOCK_LEN_SIZE;
+
+            // Validate we have enough data for the serialized block
+            if stored_block.len() < index + block_len {
+                return Err(anyhow!(
+                    "Not enough data for serialized block: need {} bytes at offset {}, have {} total",
+                    block_len,
+                    index,
+                    stored_block.len()
+                ));
+            }
+
+            let block_bytes = &stored_block[index..index + block_len];
+            let mut block = Block::from_bytes(block_bytes).map_err(|e| {
+                anyhow!(
+                    "Failed to deserialize block: {} (block_bytes len: {}, expected in block: {})",
+                    e,
+                    block_bytes.len(),
+                    block_len
+                )
+            })?;
+            let decrypted_block_data = {
+                // Decrypt AES key with RSA-OAEP
+                let aes_key = (|| -> Result<Vec<u8>> {
+                    let rsa = self.private_key.expose_secret().der_bytes.as_slice();
+                    let pkey = PKey::private_key_from_der(rsa)
+                        .map_err(|e| anyhow!("Failed to reconstruct private key: {}", e))?;
+                    let rsa = pkey
+                        .rsa()
+                        .map_err(|e| anyhow!("Failed to get RSA key: {}", e))?;
+                    let mut plaintext = vec![0u8; rsa.size() as usize];
+                    let len = rsa
+                        .private_decrypt(encrypted_aes_key, &mut plaintext, Padding::PKCS1_OAEP)
+                        .map_err(|e| anyhow!("RSA decryption failed: {}", e))?;
+                    plaintext.truncate(len);
+                    Ok(plaintext)
+                })()?;
+
+                // Decrypt block data with AES-GCM
+                let decrypted_data = openssl::symm::decrypt_aead(
+                    Cipher::aes_256_gcm(),
+                    &aes_key,
+                    Some(nonce),
+                    &[],
+                    &block.block_data,
+                    tag,
+                )
+                .map_err(|e| anyhow!("AES-GCM decryption failed: {}", e))?;
+                decrypted_data
+            };
+            block.block_data = decrypted_block_data;
+            Ok(block)
+        })()?;
+
+        Ok(block)
     }
 
     /// Get the total number of blocks stored in the blockchain

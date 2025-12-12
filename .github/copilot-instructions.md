@@ -26,9 +26,10 @@ A **generic, data-agnostic blockchain library** with persistent storage, hybrid 
 
 - **[src/db_model.rs](src/db_model.rs)**: RocksDB configuration with presets
   - Presets: `high_performance()`, `high_durability()`, `read_only()`
-  - Builder pattern: `.with_block_cache_size()`, `.with_compression()`, `.with_sync_writes()`
-  - Default: 512MB block cache, 64MB write buffer, LZ4 compression
-  - Column families (tables): configure with `.with_column_family()`
+  - Builder methods: `.with_block_cache_size_mb()`, `.with_write_buffer_size_mb()`, `.with_compression()`, `.with_sync_writes()`, `.with_column_family()`
+  - Default: 512MB block cache, 64MB write buffer, LZ4 compression, Zstd for bottommost level
+  - Column families (tables): configure with `.with_column_family()` - must be added before `.open()`
+  - Call `.open()` to create `rocksdb::DB` instance
 
 ### Key Design Decisions
 - **Data-agnostic**: `block_data: Vec<u8>` - applications define the payload structure
@@ -37,9 +38,7 @@ A **generic, data-agnostic blockchain library** with persistent storage, hybrid 
 - **Transparent encryption**: Encrypt on write, decrypt on read - users see plaintext `block_data`
 - **Security by default**: All block data encrypted with unique AES-256-GCM keys per block
 - **Column families**: RocksDB's equivalent of "tables" - accessed via `cf_handle()`
-- **External dependencies**: 
-  - `libcertcrypto` (path dependency: `../libcertcrypto`) - verify if still used
-  - `rocksdb` with `mt_static` feature for multi-threaded static linking
+- **External dependencies**: `rocksdb` with `mt_static` feature for multi-threaded static linking, OpenSSL for crypto
 
 ## Data Types & Constants
 
@@ -56,20 +55,41 @@ const AES_GCM_NONCE_SIZE: usize = 12;    // 96-bit nonce
 const AES_GCM_TAG_SIZE: usize = 16;      // 128-bit auth tag
 ```
 
+## Core API Methods
+
+### BlockChain Operations
+```rust
+// Initialization & insertion
+BlockChain::new(path, private_key_path)  // Opens/creates blockchain, prompts for password
+.put_block(data: Vec<u8>)                // Insert block with automatic height assignment
+
+// Querying
+.get_block_by_height(height: u64)        // Retrieve by height (0-indexed)
+.get_block_by_uuid(&uuid)                // Retrieve by UUID, returns Option<Block>
+.get_latest_block()                      // Get highest height block
+.get_height()                            // Get current height (next to be assigned)
+.block_count()                           // Total blocks in chain
+.block_exists(&uuid)                     // Check UUID existence
+
+// Validation & iteration
+.validate()                              // Verify entire chain integrity (parent hashes)
+.iter()                                  // Returns BlockIterator for sequential traversal
+```
+
 ## Development Workflow
 
 ### Build & Test
 ```bash
 cargo build                    # Compile library
-cargo test                     # Run unit tests (db_model tests exist)
+cargo test                     # Run unit tests (db_model has tests)
 cargo doc --open               # View documentation
 cargo check                    # Fast type checking
 ```
 
 ### Testing Private Key Encryption
-The library prompts for passwords at runtime. To test:
+The library prompts for passwords at runtime. Generate test keys:
 ```bash
-# Generate test RSA key (4096-bit recommended)
+# Generate RSA key (4096-bit recommended)
 openssl genrsa -aes256 -out test_key.pem 4096
 
 # Or unencrypted for testing
@@ -79,8 +99,10 @@ openssl genrsa -out test_key_nopass.pem 4096
 ### Database Inspection
 ```rust
 // RocksDB data stored at: <path> directory
-// Use RocksDB tools or rust code to inspect:
-use rocksdb::{DB, IteratorMode};
+// Use RocksDB CLI or Rust code to inspect:
+use rocksdb::{DB, IteratorMode, Options};
+let mut opts = Options::default();
+opts.create_if_missing(false);
 let db = DB::open_cf(&opts, "./my_blockchain", &["blocks", "height"])?;
 let blocks_cf = db.cf_handle("blocks").unwrap();
 let height_cf = db.cf_handle("height").unwrap();
@@ -136,13 +158,14 @@ let height_cf = db.cf_handle("height").unwrap();
 - **Thread safety**: Database already wrapped in `Arc<DB>`, `current_height` is Mutex-protected
 - **Column family handles**: Always check `cf_handle()` returns `Some` before using - panic if None
 - **Iterator sizing**: RocksDB iterators return `Box<[u8]>`, not `&[u8]` - copy to fixed-size arrays
-- **Path dependencies**: `libcertcrypto = { path = "../libcertcrypto" }` - verify location exists or remove if unused
-- **Edition 2024**: Cargo.toml uses `edition = "2024"` which may not be stable on all toolchains
+- **Edition 2024**: Cargo.toml uses `edition = "2024"` - may require nightly Rust or recent stable (1.85+)
+- **Password prompts**: `BlockChain::new()` calls `rpassword::prompt_password_stderr()` - cannot be automated in tests
 
 ## Incomplete/Future Work
-- **No integration tests**: `tests/` directory exists but is empty - no tests in blockchain.rs
+- **No integration tests**: `tests/` directory exists but is empty - add tests that use real encrypted blocks
 - **No consensus mechanism**: PoW/PoS not implemented - nonce field exists in BlockHeader but unused
 - **No network layer**: Purely local storage, no P2P or synchronization
 - **No block validation hooks**: Applications can't inject custom validation rules
 - **Iterator limitations**: No reverse iteration, filtering, or seeking to specific heights
 - **SledDB removed**: Migration to RocksDB complete, but no backward compatibility with Sled databases
+- **No benchmark suite**: Consider adding criterion benchmarks for encryption/decryption performance

@@ -195,7 +195,7 @@ impl BlockChain {
     ///
     // The format of the block storded in the database is:
     // RSA Encrypted AES key (variable length) || AES-GCM nonce (12 bytes) || AES-GCM tag (16 bytes) || AES-GCM ciphertext (variable length)
-    pub fn put_block(&self, block_data: Vec<u8>) -> Result<()> {
+    pub fn put_block(&self, block_data: Vec<u8>) -> Result<[u8; BLOCK_UID_SIZE]> {
         let mut height = self.current_height.lock().unwrap();
         let (encrypted_aes_key, encrypted_block_data, nonce, tag) =
             (|| -> Result<(Vec<u8>, Vec<u8>, [u8; AES_GCM_NONCE_SIZE], [u8; AES_GCM_TAG_SIZE])> {
@@ -296,7 +296,7 @@ impl BlockChain {
             .flush()
             .map_err(|e| anyhow!("Failed to flush database: {}", e))?;
 
-        Ok(())
+        Ok(block.block_header.block_uid)
     }
 
     /// Retrieve a block by its height in the chain

@@ -9,7 +9,7 @@
 //!
 //! The blockchain uses two RocksDB column families:
 //! - `blocks`: Maps block UUID (16 bytes) to serialized Block data
-//! - `height`: Maps block height (u64 as big-endian bytes) to block UUID
+//! - `height`: Maps block height (u64 as little-endian bytes) to block UUID
 //!
 //! # Concurrency
 //!
@@ -34,9 +34,9 @@ pub const AES_GCM_NONCE_SIZE: usize = 12; // 96 bits
 pub const AES_GCM_TAG_SIZE: usize = 16; // 128 bits
 pub const BLOCK_LEN_SIZE: usize = 4; // u32 for block length
 
-/// SledDB-backed blockchain storage with automatic height management
+/// RocksDB-backed blockchain storage with automatic height management
 ///
-/// This structure maintains a persistent blockchain using SledDB's embedded
+/// This structure maintains a persistent blockchain using RocksDB's embedded
 /// key-value store. Blocks are stored by UUID, and a separate index maps
 /// heights to UUIDs for efficient sequential access.
 ///
@@ -121,7 +121,7 @@ impl BlockChain {
                     let mut bytes = [0u8; 8];
                     bytes.copy_from_slice(&height_bytes);
                     // Last block is at this height, so next block should be height + 1
-                    u64::from_be_bytes(bytes) + 1
+                    u64::from_le_bytes(bytes) + 1
                 }
                 _ => 0, // Empty blockchain, start at height 0
             }
@@ -184,7 +184,7 @@ impl BlockChain {
     /// * `block_data` - The raw data to store in the block (will be encrypted)
     ///
     /// # Returns
-    /// `Ok(())` on success
+    /// `Ok([u8; BLOCK_UID_SIZE])` - The UUID of the newly inserted block on success
     ///
     /// # Errors
     /// Returns an error if:
@@ -279,7 +279,7 @@ impl BlockChain {
             .map_err(|e| anyhow!("Failed to insert block: {}", e))?;
 
         // Store height -> UUID mapping
-        let height_bytes = height.to_be_bytes();
+        let height_bytes = height.to_le_bytes();
         let height_cf = self
             .db
             .cf_handle("height")
@@ -305,11 +305,10 @@ impl BlockChain {
     /// * `height` - The block height (0 for genesis, 1 for first block after genesis, etc.)
     ///
     /// # Returns
-    /// - `Ok(Some(Block))` if a block exists at this height
-    /// - `Ok(None)` if no block exists at this height
-    /// - `Err(_)` if a database or deserialization error occurs
+    /// - `Ok(Block)` if a block exists at this height
+    /// - `Err(_)` if no block exists at this height or a database/deserialization error occurs
     pub fn get_block_by_height(&self, height: u64) -> Result<Block> {
-        let height_bytes = height.to_be_bytes();
+        let height_bytes = height.to_le_bytes();
         let height_cf = self
             .db
             .cf_handle("height")
@@ -457,7 +456,7 @@ impl BlockChain {
     /// not from the `current_height` mutex.
     ///
     /// # Returns
-    /// The height of the last block, or 0 for an empty chain
+    /// `Ok(u64)` - The height of the last block (0-indexed), or 0 for an empty chain
     pub fn get_height(&self) -> Result<u64> {
         let height_cf = self
             .db
@@ -469,7 +468,7 @@ impl BlockChain {
             Some(Ok((height_bytes, _))) => {
                 let mut bytes = [0u8; 8];
                 bytes.copy_from_slice(&height_bytes);
-                Ok(u64::from_be_bytes(bytes))
+                Ok(u64::from_le_bytes(bytes))
             }
             _ => Ok(0), // Empty blockchain
         }
@@ -478,12 +477,10 @@ impl BlockChain {
     /// Get the most recently inserted block
     ///
     /// Returns the block at the highest height (current_height - 1).
-    /// Returns `None` for an empty blockchain.
     ///
     /// # Returns
-    /// - `Ok(Some(Block))` if blocks exist
-    /// - `Ok(None)` if the blockchain is empty
-    /// - `Err(_)` if a database or deserialization error occurs
+    /// - `Ok(Block)` if blocks exist
+    /// - `Err(_)` if the blockchain is empty or a database/deserialization error occurs
     pub fn get_latest_block(&self) -> Result<Block> {
         let height = *self.current_height.lock().unwrap();
         if height == 0 {
@@ -491,6 +488,72 @@ impl BlockChain {
         } else {
             self.get_block_by_height(height - 1)
         }
+    }
+
+    /// Delete the most recently inserted block
+    ///
+    /// Deletes the block at the highest height (current_height - 1).
+    /// Returns the UUID of the deleted block.
+    ///
+    /// # Returns
+    /// - `Ok(Some([u8; BLOCK_UID_SIZE]))` - UUID of the deleted block if blocks exist
+    /// - `Ok(None)` - If the blockchain is empty
+    /// - `Err(_)` - If a database or deserialization error occurs
+    pub fn delete_latest_block(&self) -> Result<Option<[u8; BLOCK_UID_SIZE]>> {
+        let mut height = self.current_height.lock().unwrap();
+        if *height == 0 {
+            return Ok(None); // Empty blockchain
+        }
+        let latest_height = *height - 1;
+
+        // Get block UUID at this height
+        let height_bytes = latest_height.to_le_bytes();
+        let height_cf = self
+            .db
+            .cf_handle("height")
+            .ok_or_else(|| anyhow!("Failed to get height column family"))?;
+
+        let block_uuid = match self
+            .db
+            .get_cf(height_cf, &height_bytes)
+            .map_err(|e| anyhow!("Failed to get block UUID by height: {}", e))?
+        {
+            Some(uuid_bytes) => {
+                let mut uuid = [0u8; BLOCK_UID_SIZE];
+                uuid.copy_from_slice(&uuid_bytes);
+                uuid
+            }
+            None => {
+                return Err(anyhow!(
+                    "No block found at height {} during deletion",
+                    latest_height
+                ));
+            }
+        };
+
+        // Delete block from blocks column family
+        let blocks_cf = self
+            .db
+            .cf_handle("blocks")
+            .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
+        self.db
+            .delete_cf(blocks_cf, &block_uuid)
+            .map_err(|e| anyhow!("Failed to delete block: {}", e))?;
+
+        // Delete height index entry
+        self.db
+            .delete_cf(height_cf, &height_bytes)
+            .map_err(|e| anyhow!("Failed to delete height index: {}", e))?;
+
+        // Decrement current height
+        *height -= 1;
+
+        // Flush to ensure durability
+        self.db
+            .flush()
+            .map_err(|e| anyhow!("Failed to flush database: {}", e))?;
+
+        Ok(Some(block_uuid))
     }
 
     /// Check if a block with the given UUID exists in the database

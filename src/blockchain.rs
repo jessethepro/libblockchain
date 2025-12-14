@@ -179,7 +179,7 @@ impl BlockChain {
     /// * `block_data` - The raw data to store in the block (will be encrypted)
     ///
     /// # Returns
-    /// `Ok([u8; BLOCK_UID_SIZE])` - The UUID of the newly inserted block on success
+    /// `Ok(u64)` - The Height of the newly inserted block on success
     ///
     /// # Errors
     /// Returns an error if:
@@ -193,7 +193,7 @@ impl BlockChain {
     //
     // EncryptedBlockData format:
     // aes_key_len(4) || RSA-OAEP(aes_key)(var) || nonce(12) || tag(16) || data_len(4) || AES-GCM(data)(var)
-    pub fn put_block(&self, block_data: Vec<u8>) -> Result<[u8; BLOCK_UID_SIZE]> {
+    pub fn put_block(&self, block_data: Vec<u8>) -> Result<u64> {
         let encrypted_block_data = (|| -> Result<Vec<u8>> {
             // Generate random AES-256 key (32 bytes)
             let mut aes_key = [0u8; AES_GCM_256_KEY_SIZE];
@@ -270,7 +270,7 @@ impl BlockChain {
             .flush()
             .map_err(|e| anyhow!("Failed to flush database: {}", e))?;
 
-        Ok(block.block_header.block_uid)
+        Ok(block.block_header.height)
     }
 
     /// Retrieve a block by its height in the chain

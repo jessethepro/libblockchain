@@ -2,23 +2,42 @@
 //!
 //! This module provides persistent storage for blockchain blocks using RocksDB,
 //! a high-performance embedded database. The blockchain automatically manages
-//! block heights and parent relationships, storing blocks by UUID with a
-//! separate height index for efficient retrieval.
+//! block heights and parent relationships, storing blocks by height for
+//! efficient retrieval and sequential access.
+//!
+//! **Note**: RocksDB is compiled from source with the `mt_static` feature for
+//! multi-threaded static linking. This ensures thread-safe operation without
+//! requiring system-installed RocksDB libraries.
 //!
 //! # Database Structure
 //!
-//! The blockchain uses two RocksDB column families:
-//! - `blocks`: Maps block UUID (16 bytes) to serialized Block data
-//! - `height`: Maps block height (u64 as little-endian bytes) to block UUID
+//! The blockchain uses one RocksDB column family:
+//! - `blocks`: Maps block height (u64 as little-endian bytes) to encrypted Block data
+//!
+//! # Storage Format
+//!
+//! Blocks are serialized as:
+//! ```text
+//! BlockHeader(100) || BlockHash(64) || EncryptedBlockData(variable)
+//! ```
+//!
+//! Only the block_data field is encrypted with hybrid encryption:
+//! ```text
+//! [aes_key_len(4)] || [RSA-OAEP(aes_key)(var)] || [nonce(12)] || [tag(16)] || [data_len(4)] || [AES-GCM(data)(var)]
+//! ```
+//!
+//! The application's private key is required to RSA-OAEP decrypt the AES key,
+//! which is then used to AES-GCM decrypt the actual block data.
 //!
 //! # Concurrency
 //!
-//! The `current_height` field is protected by a `Mutex` to allow safe
-//! concurrent access. This represents the next height to be assigned.
+//! The database is Arc-wrapped and thread-safe. RocksDB handles concurrent
+//! reads efficiently, while writes are serialized internally.
 
-use crate::block::{BLOCK_HASH_SIZE, BLOCK_UID_SIZE, Block};
+use crate::block::{BLOCK_HASH_SIZE, BLOCK_HEIGHT_SIZE, BLOCK_UID_SIZE, Block};
 use crate::db_model::RocksDbModel;
 use anyhow::{Context, Result, anyhow};
+use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
 use openssl::rsa::Padding;
 use openssl::symm::Cipher;
@@ -26,24 +45,24 @@ use rocksdb::{DB, IteratorMode};
 use secrecy::{ExposeSecret, SecretBox, zeroize::Zeroize};
 use std::fmt;
 use std::path::Path;
-use std::sync::Mutex;
 
 pub const AES_KEY_LEN_SIZE: usize = 4; // u32 for AES key length
 pub const AES_GCM_256_KEY_SIZE: usize = 32; // 256 bits
 pub const AES_GCM_NONCE_SIZE: usize = 12; // 96 bits
 pub const AES_GCM_TAG_SIZE: usize = 16; // 128 bits
-pub const BLOCK_LEN_SIZE: usize = 4; // u32 for block length
+pub const DATA_LEN_SIZE: usize = 4; // u32 for block length
 
 /// RocksDB-backed blockchain storage with automatic height management
 ///
 /// This structure maintains a persistent blockchain using RocksDB's embedded
-/// key-value store. Blocks are stored by UUID, and a separate index maps
-/// heights to UUIDs for efficient sequential access.
+/// key-value store. Blocks are stored directly by height (u64) as the key,
+/// enabling efficient sequential access via RocksDB's native iterator.
 ///
 /// # Thread Safety
 ///
-/// The `BlockChain` can be safely shared across threads. The `current_height`
-/// field is protected by a `Mutex` to ensure consistent height assignment.
+/// The `BlockChain` is thread-safe with an Arc-wrapped RocksDB instance.
+/// Multiple readers can access blocks concurrently, while RocksDB serializes
+/// write operations internally.
 ///
 /// A securely stored private key that implements Zeroize
 #[derive(Clone)]
@@ -67,11 +86,6 @@ impl fmt::Debug for SecurePrivateKey {
 pub struct BlockChain {
     /// RocksDB database instance
     db: std::sync::Arc<DB>,
-
-    /// Next height to be assigned (protected by Mutex for thread safety)
-    /// When inserting a new block, it will be assigned this height,
-    /// then this value is incremented.
-    current_height: Mutex<u64>,
 
     /// Secured Private key for decrypting block data
     private_key: SecretBox<SecurePrivateKey>,
@@ -103,29 +117,11 @@ impl BlockChain {
     pub fn new<P: AsRef<Path>>(path: P, private_key_path: P) -> Result<Self> {
         let db = RocksDbModel::new(path.as_ref().to_path_buf())
             .with_column_family("blocks")
-            .with_column_family("height")
+            .with_column_family("signatures")
             .open()
             .map_err(|e| anyhow!("Failed to open RocksDB: {}", e))?;
 
         let db = std::sync::Arc::new(db);
-
-        // Get the next height to assign based on the highest block in the database
-        let height_cf = db
-            .cf_handle("height")
-            .ok_or_else(|| anyhow!("Failed to get height column family"))?;
-
-        let next_height = {
-            let mut iter = db.iterator_cf(height_cf, IteratorMode::End);
-            match iter.next() {
-                Some(Ok((height_bytes, _block_uuid))) => {
-                    let mut bytes = [0u8; 8];
-                    bytes.copy_from_slice(&height_bytes);
-                    // Last block is at this height, so next block should be height + 1
-                    u64::from_le_bytes(bytes) + 1
-                }
-                _ => 0, // Empty blockchain, start at height 0
-            }
-        };
 
         // Load private key from PEM file
 
@@ -166,7 +162,6 @@ impl BlockChain {
 
         Ok(Self {
             db,
-            current_height: Mutex::new(next_height),
             private_key: SecretBox::new(Box::new(SecurePrivateKey {
                 der_bytes: private_key_der,
             })),
@@ -193,103 +188,82 @@ impl BlockChain {
     /// - Database insertion fails
     /// - Database flush fails
     ///
-    // The format of the block storded in the database is:
-    // RSA Encrypted AES key (variable length) || AES-GCM nonce (12 bytes) || AES-GCM tag (16 bytes) || AES-GCM ciphertext (variable length)
+    // Only block_data is encrypted. Block format in database:
+    // BlockHeader(100) || BlockHash(64) || EncryptedBlockData(variable)
+    //
+    // EncryptedBlockData format:
+    // aes_key_len(4) || RSA-OAEP(aes_key)(var) || nonce(12) || tag(16) || data_len(4) || AES-GCM(data)(var)
     pub fn put_block(&self, block_data: Vec<u8>) -> Result<[u8; BLOCK_UID_SIZE]> {
-        let mut height = self.current_height.lock().unwrap();
-        let (encrypted_aes_key, encrypted_block_data, nonce, tag) =
-            (|| -> Result<(Vec<u8>, Vec<u8>, [u8; AES_GCM_NONCE_SIZE], [u8; AES_GCM_TAG_SIZE])> {
-                // Generate random AES-256 key (32 bytes)
-                let mut aes_key = [0u8; AES_GCM_256_KEY_SIZE];
-                openssl::rand::rand_bytes(&mut aes_key)
-                    .map_err(|e| anyhow!("Failed to generate random AES key: {}", e))?;
+        let encrypted_block_data = (|| -> Result<Vec<u8>> {
+            // Generate random AES-256 key (32 bytes)
+            let mut aes_key = [0u8; AES_GCM_256_KEY_SIZE];
+            openssl::rand::rand_bytes(&mut aes_key)
+                .map_err(|e| anyhow!("Failed to generate random AES key: {}", e))?;
 
-                // Generate random 12-byte nonce
-                let mut nonce = [0u8; AES_GCM_NONCE_SIZE];
-                openssl::rand::rand_bytes(&mut nonce)
-                    .map_err(|e| anyhow!("Failed to generate random nonce: {}", e))?;
+            // Generate random 12-byte nonce
+            let mut nonce = [0u8; AES_GCM_NONCE_SIZE];
+            openssl::rand::rand_bytes(&mut nonce)
+                .map_err(|e| anyhow!("Failed to generate random nonce: {}", e))?;
 
-                let cipher = Cipher::aes_256_gcm();
-                let mut tag = [0u8; AES_GCM_TAG_SIZE];
+            let cipher = Cipher::aes_256_gcm();
+            let mut tag = [0u8; AES_GCM_TAG_SIZE];
 
-                let encrypted_block_data = openssl::symm::encrypt_aead(
-                    cipher,
-                    &aes_key,
-                    Some(&nonce),
-                    &[],
-                    &block_data,
-                    &mut tag,
-                )
-                .map_err(|e| anyhow!("AES-GCM encryption failed: {}", e))?;
+            let encrypted_block_data = openssl::symm::encrypt_aead(
+                cipher,
+                &aes_key,
+                Some(&nonce),
+                &[],
+                &block_data,
+                &mut tag,
+            )
+            .map_err(|e| anyhow!("AES-GCM encryption failed: {}", e))?;
 
-                // Encrypt AES key with RSA-OAEP
-                let encrypted_aes_key = (|| -> Result<Vec<u8>> {
-                    let rsa = self
-                        .public_key
-                        .rsa()
-                        .map_err(|e| anyhow!("Failed to get RSA key: {}", e))?;
-                    let mut ciphertext = vec![0u8; rsa.size() as usize];
-                    let len = rsa
-                        .public_encrypt(&aes_key, &mut ciphertext, Padding::PKCS1_OAEP)
-                        .map_err(|e| anyhow!("RSA encryption failed: {}", e))?;
+            // Encrypt AES key with RSA-OAEP
+            let encrypted_aes_key = (|| -> Result<Vec<u8>> {
+                let rsa = self
+                    .public_key
+                    .rsa()
+                    .map_err(|e| anyhow!("Failed to get RSA key: {}", e))?;
+                let mut ciphertext = vec![0u8; rsa.size() as usize];
+                let len = rsa
+                    .public_encrypt(&aes_key, &mut ciphertext, Padding::PKCS1_OAEP)
+                    .map_err(|e| anyhow!("RSA encryption failed: {}", e))?;
 
-                    ciphertext.truncate(len);
-                    Ok(ciphertext)
-                })()?;
-                Ok((encrypted_aes_key, encrypted_block_data, nonce, tag))
+                ciphertext.truncate(len);
+                Ok(ciphertext)
             })()?;
-        let block = if *height == 0 {
+            let serialized_block_data = {
+                let mut data = Vec::new();
+                let aes_key_len = encrypted_aes_key.len() as u32;
+                data.extend_from_slice(&aes_key_len.to_le_bytes());
+                data.extend_from_slice(&encrypted_aes_key);
+                data.extend_from_slice(&nonce);
+                data.extend_from_slice(&tag);
+                let data_len = encrypted_block_data.len() as u32;
+                data.extend_from_slice(&data_len.to_le_bytes());
+                data.extend_from_slice(&encrypted_block_data);
+                data
+            };
+            Ok(serialized_block_data)
+        })()?;
+        let block_count = self.block_count()?;
+        let block = if block_count == 0 {
             Block::new_genesis_block(encrypted_block_data)
         } else {
-            // Get the previous block (at height - 1)
-            let parent_block = self.get_block_by_height(*height - 1)?;
+            // Get the previous block which is 1 less than block count
+            let parent_block = self.get_block_by_height(block_count - 1)?;
             let parent_hash = parent_block.block_hash;
-            Block::new_regular_block(parent_hash, encrypted_block_data)
+            Block::new_regular_block(block_count, parent_hash, encrypted_block_data)
         };
-        use crate::block::BLOCK_UID_SIZE;
-        let (uuid, stored_block_bytes) = (|| -> Result<([u8; BLOCK_UID_SIZE], Vec<u8>)> {
-            let stored_block_bytes = {
-                let mut bytes = Vec::new();
-                let key_len = encrypted_aes_key.len() as u32;
-                // Append length of encrypted AES key (4 bytes)
-                bytes.extend_from_slice(&key_len.to_le_bytes());
-                // Append encrypted AES key
-                bytes.extend_from_slice(&encrypted_aes_key);
-                // Append nonce
-                bytes.extend_from_slice(&nonce);
-                // Append tag
-                bytes.extend_from_slice(&tag);
-                // Append Block
-                let block_bytes = block.bytes();
-                let block_len = block_bytes.len() as u32;
-                bytes.extend_from_slice(&block_len.to_le_bytes());
-                bytes.extend_from_slice(&block_bytes);
-                bytes
-            };
-            Ok((block.block_header.block_uid, stored_block_bytes))
-        })()?;
-
+        let height = block.block_header.height;
         // Store block by UUID
         let blocks_cf = self
             .db
             .cf_handle("blocks")
             .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
         self.db
-            .put_cf(blocks_cf, uuid, &stored_block_bytes)
+            .put_cf(blocks_cf, height.to_le_bytes(), &block.bytes())
             .map_err(|e| anyhow!("Failed to insert block: {}", e))?;
-
-        // Store height -> UUID mapping
-        let height_bytes = height.to_le_bytes();
-        let height_cf = self
-            .db
-            .cf_handle("height")
-            .ok_or_else(|| anyhow!("Failed to get height column family"))?;
-        self.db
-            .put_cf(height_cf, &height_bytes, &block.block_header.block_uid)
-            .map_err(|e| anyhow!("Failed to insert height index: {}", e))?;
-
-        // Increment height for next block
-        *height += 1;
 
         // Flush to ensure durability
         self.db
@@ -308,145 +282,82 @@ impl BlockChain {
     /// - `Ok(Block)` if a block exists at this height
     /// - `Err(_)` if no block exists at this height or a database/deserialization error occurs
     pub fn get_block_by_height(&self, height: u64) -> Result<Block> {
-        let height_bytes = height.to_le_bytes();
-        let height_cf = self
+        let blocks_cf = self
             .db
-            .cf_handle("height")
-            .ok_or_else(|| anyhow!("Failed to get height column family"))?;
-
-        let stored_block = match self
-            .db
-            .get_cf(height_cf, &height_bytes)
-            .map_err(|e| anyhow!("Failed to get block UUID by height: {}", e))?
-        {
-            Some(uuid_bytes) => {
-                let mut uuid = [0u8; 16];
-                uuid.copy_from_slice(&uuid_bytes);
-                let blocks_cf = self
-                    .db
-                    .cf_handle("blocks")
-                    .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
-
-                match self
-                    .db
-                    .get_cf(blocks_cf, &uuid)
-                    .map_err(|e| anyhow!("Failed to get block by UUID: {}", e))?
-                {
-                    Some(block_bytes) => block_bytes,
-                    None => {
-                        return Err(anyhow!(
-                            "Block UUID {:?} not found in blocks column family",
-                            uuid
-                        ));
-                    }
-                }
-            }
-            None => return Err(anyhow!("No block found at height {}", height)),
-        };
+            .cf_handle("blocks")
+            .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
         let block = (|| -> Result<Block> {
-            // Deserialize block from bytes
-            let mut index: usize = 0;
-
-            // Validate minimum size
-            if stored_block.len() < AES_KEY_LEN_SIZE {
+            let block_bytes = self
+                .db
+                .get_cf(blocks_cf, height.to_le_bytes())
+                .map_err(|e| anyhow!("Failed to get block by height: {}", e))?
+                .ok_or_else(|| anyhow!("No block found at height {}", height))?;
+            if height != u64::from_le_bytes(block_bytes[0..BLOCK_HEIGHT_SIZE].try_into().unwrap()) {
                 return Err(anyhow!(
-                    "Stored block too small: {} bytes (need at least {})",
-                    stored_block.len(),
-                    AES_KEY_LEN_SIZE
+                    "Block height mismatch: expected {}, got {}",
+                    height,
+                    u64::from_le_bytes(block_bytes[0..BLOCK_HEIGHT_SIZE].try_into().unwrap())
                 ));
             }
-
-            let aes_key_len =
-                u32::from_le_bytes(stored_block[index..AES_KEY_LEN_SIZE].try_into().unwrap())
-                    as usize;
-            index += AES_KEY_LEN_SIZE;
-
-            // Validate we have enough data for encrypted AES key
-            if stored_block.len() < index + aes_key_len {
-                return Err(anyhow!(
-                    "Not enough data for encrypted AES key: need {} bytes at offset {}, have {} total",
-                    aes_key_len,
-                    index,
-                    stored_block.len()
-                ));
-            }
-
-            let encrypted_aes_key = &stored_block[index..index + aes_key_len];
-            index += aes_key_len;
-
-            // Validate we have enough data for nonce and tag
-            if stored_block.len() < index + AES_GCM_NONCE_SIZE + AES_GCM_TAG_SIZE + BLOCK_LEN_SIZE {
-                return Err(anyhow!(
-                    "Not enough data for nonce, tag, and block length at offset {}, have {} total",
-                    index,
-                    stored_block.len()
-                ));
-            }
-
-            let nonce = &stored_block[index..index + AES_GCM_NONCE_SIZE];
-            index += AES_GCM_NONCE_SIZE;
-            let tag = &stored_block[index..index + AES_GCM_TAG_SIZE];
-            index += AES_GCM_TAG_SIZE;
-            let block_len = u32::from_le_bytes(
-                stored_block[index..index + BLOCK_LEN_SIZE]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            index += BLOCK_LEN_SIZE;
-
-            // Validate we have enough data for the serialized block
-            if stored_block.len() < index + block_len {
-                return Err(anyhow!(
-                    "Not enough data for serialized block: need {} bytes at offset {}, have {} total",
-                    block_len,
-                    index,
-                    stored_block.len()
-                ));
-            }
-
-            let block_bytes = &stored_block[index..index + block_len];
-            let mut block = Block::from_bytes(block_bytes).map_err(|e| {
-                anyhow!(
-                    "Failed to deserialize block: {} (block_bytes len: {}, expected in block: {})",
-                    e,
-                    block_bytes.len(),
-                    block_len
-                )
-            })?;
-            let decrypted_block_data = {
-                // Decrypt AES key with RSA-OAEP
-                let aes_key = (|| -> Result<Vec<u8>> {
-                    let rsa = self.private_key.expose_secret().der_bytes.as_slice();
-                    let pkey = PKey::private_key_from_der(rsa)
-                        .map_err(|e| anyhow!("Failed to reconstruct private key: {}", e))?;
-                    let rsa = pkey
-                        .rsa()
-                        .map_err(|e| anyhow!("Failed to get RSA key: {}", e))?;
-                    let mut plaintext = vec![0u8; rsa.size() as usize];
-                    let len = rsa
-                        .private_decrypt(encrypted_aes_key, &mut plaintext, Padding::PKCS1_OAEP)
-                        .map_err(|e| anyhow!("RSA decryption failed: {}", e))?;
-                    plaintext.truncate(len);
-                    Ok(plaintext)
-                })()?;
-
-                // Decrypt block data with AES-GCM
-                let decrypted_data = openssl::symm::decrypt_aead(
-                    Cipher::aes_256_gcm(),
-                    &aes_key,
-                    Some(nonce),
-                    &[],
-                    &block.block_data,
-                    tag,
-                )
-                .map_err(|e| anyhow!("AES-GCM decryption failed: {}", e))?;
-                decrypted_data
-            };
-            block.block_data = decrypted_block_data;
+            let mut block = Block::from_bytes(&block_bytes)?;
+            block.block_data = self.decrypt_block_data(&block.block_data)?;
             Ok(block)
         })()?;
-
         Ok(block)
+    }
+
+    fn decrypt_block_data(&self, encrypted_block_data: &[u8]) -> Result<Vec<u8>> {
+        let mut index = 0;
+        let aes_key_len = u32::from_le_bytes(
+            // u32 for the length of the encrypted AES key
+            encrypted_block_data[index..index + AES_KEY_LEN_SIZE]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        index += AES_KEY_LEN_SIZE;
+        let encrypted_aes_key = &encrypted_block_data[index..index + aes_key_len];
+        index += aes_key_len;
+        let nonce = &encrypted_block_data[index..index + AES_GCM_NONCE_SIZE];
+        index += AES_GCM_NONCE_SIZE;
+        let tag = &encrypted_block_data[index..index + AES_GCM_TAG_SIZE];
+        index += AES_GCM_TAG_SIZE;
+        let data_len = u32::from_le_bytes(
+            encrypted_block_data[index..index + DATA_LEN_SIZE]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        index += DATA_LEN_SIZE;
+        let data_bytes = &encrypted_block_data[index..index + data_len];
+        let decrypted_data = {
+            // Decrypt AES key with RSA-OAEP
+            let aes_key = (|| -> Result<Vec<u8>> {
+                let rsa = self.private_key.expose_secret().der_bytes.as_slice();
+                let pkey = PKey::private_key_from_der(rsa)
+                    .map_err(|e| anyhow!("Failed to reconstruct private key: {}", e))?;
+                let rsa = pkey
+                    .rsa()
+                    .map_err(|e| anyhow!("Failed to get RSA key: {}", e))?;
+                let mut plaintext = vec![0u8; rsa.size() as usize];
+                let len = rsa
+                    .private_decrypt(encrypted_aes_key, &mut plaintext, Padding::PKCS1_OAEP)
+                    .map_err(|e| anyhow!("RSA decryption failed: {}", e))?;
+                plaintext.truncate(len);
+                Ok(plaintext)
+            })()?;
+
+            // Decrypt block data with AES-GCM
+            let decrypted_data = openssl::symm::decrypt_aead(
+                Cipher::aes_256_gcm(),
+                &aes_key,
+                Some(nonce),
+                &[],
+                data_bytes,
+                tag,
+            )
+            .map_err(|e| anyhow!("AES-GCM decryption failed: {}", e))?;
+            decrypted_data
+        };
+        Ok(decrypted_data)
     }
 
     /// Get the height of the last block in the chain
@@ -457,37 +368,9 @@ impl BlockChain {
     ///
     /// # Returns
     /// `Ok(u64)` - The height of the last block (0-indexed), or 0 for an empty chain
-    pub fn get_height(&self) -> Result<u64> {
-        let height_cf = self
-            .db
-            .cf_handle("height")
-            .ok_or_else(|| anyhow!("Failed to get height column family"))?;
-
-        let mut iter = self.db.iterator_cf(height_cf, IteratorMode::End);
-        match iter.next() {
-            Some(Ok((height_bytes, _))) => {
-                let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(&height_bytes);
-                Ok(u64::from_le_bytes(bytes))
-            }
-            _ => Ok(0), // Empty blockchain
-        }
-    }
-
-    /// Get the most recently inserted block
-    ///
-    /// Returns the block at the highest height (current_height - 1).
-    ///
-    /// # Returns
-    /// - `Ok(Block)` if blocks exist
-    /// - `Err(_)` if the blockchain is empty or a database/deserialization error occurs
-    pub fn get_latest_block(&self) -> Result<Block> {
-        let height = *self.current_height.lock().unwrap();
-        if height == 0 {
-            Err(anyhow!("No blocks in blockchain"))
-        } else {
-            self.get_block_by_height(height - 1)
-        }
+    pub fn get_max_height(&self) -> Result<u64> {
+        let count = self.block_count()?;
+        if count == 0 { Ok(0) } else { Ok(count - 1) }
     }
 
     /// Delete the most recently inserted block
@@ -499,93 +382,38 @@ impl BlockChain {
     /// - `Ok(Some([u8; BLOCK_UID_SIZE]))` - UUID of the deleted block if blocks exist
     /// - `Ok(None)` - If the blockchain is empty
     /// - `Err(_)` - If a database or deserialization error occurs
-    pub fn delete_latest_block(&self) -> Result<Option<[u8; BLOCK_UID_SIZE]>> {
-        let mut height = self.current_height.lock().unwrap();
-        if *height == 0 {
-            return Ok(None); // Empty blockchain
+    pub fn delete_latest_block(&self) -> Result<Option<u64>> {
+        let block_count = self.block_count()?;
+        match block_count {
+            0 => {
+                // Blockchain is empty
+                return Ok(None);
+            }
+            _ => {
+                // Proceed to delete the latest block
+                // Delete block from blocks column family
+                let blocks_cf = self
+                    .db
+                    .cf_handle("blocks")
+                    .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
+                self.db
+                    .delete_cf(blocks_cf, (block_count - 1).to_le_bytes())
+                    .map_err(|e| anyhow!("Failed to delete block: {}", e))?;
+            }
         }
-        let latest_height = *height - 1;
-
-        // Get block UUID at this height
-        let height_bytes = latest_height.to_le_bytes();
-        let height_cf = self
-            .db
-            .cf_handle("height")
-            .ok_or_else(|| anyhow!("Failed to get height column family"))?;
-
-        let block_uuid = match self
-            .db
-            .get_cf(height_cf, &height_bytes)
-            .map_err(|e| anyhow!("Failed to get block UUID by height: {}", e))?
-        {
-            Some(uuid_bytes) => {
-                let mut uuid = [0u8; BLOCK_UID_SIZE];
-                uuid.copy_from_slice(&uuid_bytes);
-                uuid
-            }
-            None => {
-                return Err(anyhow!(
-                    "No block found at height {} during deletion",
-                    latest_height
-                ));
-            }
-        };
-
-        // Delete block from blocks column family
-        let blocks_cf = self
-            .db
-            .cf_handle("blocks")
-            .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
-        self.db
-            .delete_cf(blocks_cf, &block_uuid)
-            .map_err(|e| anyhow!("Failed to delete block: {}", e))?;
-
-        // Delete height index entry
-        self.db
-            .delete_cf(height_cf, &height_bytes)
-            .map_err(|e| anyhow!("Failed to delete height index: {}", e))?;
-
-        // Decrement current height
-        *height -= 1;
-
-        // Flush to ensure durability
-        self.db
-            .flush()
-            .map_err(|e| anyhow!("Failed to flush database: {}", e))?;
-
-        Ok(Some(block_uuid))
-    }
-
-    /// Check if a block with the given UUID exists in the database
-    ///
-    /// # Arguments
-    /// * `uuid` - The block's UUID (16 bytes)
-    ///
-    /// # Returns
-    /// `Ok(true)` if the block exists, `Ok(false)` otherwise
-    pub fn block_exists(&self, uuid: &[u8; BLOCK_UID_SIZE]) -> Result<bool> {
-        let blocks_cf = self
-            .db
-            .cf_handle("blocks")
-            .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
-
-        Ok(self
-            .db
-            .get_cf(blocks_cf, uuid)
-            .map_err(|e| anyhow!("Failed to check block existence: {}", e))?
-            .is_some())
+        Ok(Some(block_count - 1))
     }
 
     /// Get the total number of blocks stored in the blockchain
     ///
     /// # Returns
     /// The count of blocks in the database
-    pub fn block_count(&self) -> Result<usize> {
+    pub fn block_count(&self) -> Result<u64> {
         let blocks_cf = self
             .db
             .cf_handle("blocks")
             .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
-        let count = self.db.iterator_cf(blocks_cf, IteratorMode::Start).count();
+        let count = self.db.iterator_cf(blocks_cf, IteratorMode::Start).count() as u64;
         Ok(count)
     }
 
@@ -614,44 +442,46 @@ impl BlockChain {
     /// # }
     /// ```
     pub fn validate(&self) -> Result<()> {
-        let mut previous_block: Option<Block> = None;
-        let mut height = 0u64;
-
-        for block_result in self.iter() {
+        let block_count = self.block_count()?;
+        if block_count == 0 {
+            return Ok(()); // Empty chain is valid
+        }
+        for (i, block_result) in self.iter().enumerate() {
             let block = block_result?;
-
+            let expected_height = i as u64;
+            if block.block_header.height != expected_height {
+                return Err(anyhow!(
+                    "Block height mismatch at index {}: expected {}, got {}",
+                    i,
+                    expected_height,
+                    block.block_header.height
+                ));
+            }
             // Validate genesis block
-            if height == 0 {
+            if expected_height == 0 {
                 if block.block_header.parent_hash != [0u8; BLOCK_HASH_SIZE] {
-                    return Err(anyhow!(
-                        "Genesis block has non-zero parent hash: {:?}",
-                        block.block_header.parent_hash
-                    ));
+                    return Err(anyhow!("Genesis block has non-zero parent hash"));
                 }
             } else {
-                // Validate parent link
-                let prev = previous_block
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("Internal error: missing previous block"))?;
-
-                if block.block_header.parent_hash != prev.block_hash {
+                // Validate parent linkage
+                let parent_block = self.get_block_by_height(expected_height - 1)?;
+                if block.block_header.parent_hash != parent_block.block_hash {
                     return Err(anyhow!(
-                        "Block at height {} has invalid parent hash. Expected {:?}, got {:?}",
-                        height,
-                        prev.block_hash,
-                        block.block_header.parent_hash
+                        "Block at height {} has invalid parent hash",
+                        expected_height
                     ));
                 }
             }
-
-            if block.block_hash != block.block_header.generate_block_hash() {
-                return Err(anyhow!("Block hash mismatch at height {}", height));
+            // Validate block hash
+            let computed_hash =
+                openssl::hash::hash(MessageDigest::sha512(), &block.block_header.bytes())?;
+            if computed_hash.as_ref() != block.block_hash {
+                return Err(anyhow!(
+                    "Block at height {} has invalid hash",
+                    expected_height
+                ));
             }
-
-            previous_block = Some(block);
-            height += 1;
         }
-
         Ok(())
     }
 
@@ -675,52 +505,59 @@ impl BlockChain {
     /// # }
     /// ```
     pub fn iter(&self) -> BlockIterator<'_> {
-        let current_height = *self.current_height.lock().unwrap();
-        // If blockchain is empty, set current_height > max_height to return None immediately
-        let (start_height, max_height) = if current_height > 0 {
-            (0, current_height - 1)
-        } else {
-            (1, 0) // Empty blockchain: start > max, iterator returns None immediately
-        };
+        let blocks_cf = self.db.cf_handle("blocks").expect("blocks CF not found");
+        let iter = self.db.iterator_cf(blocks_cf, IteratorMode::Start);
         BlockIterator {
-            db: self,
-            current_height: start_height,
-            max_height,
+            blockchain: self,
+            iter,
         }
     }
 }
 
 /// Iterator over blocks in the blockchain, ordered by height
 ///
-/// This iterator traverses blocks sequentially from height 0 to the maximum
-/// height captured at iterator creation. Blocks inserted after the iterator
-/// is created will not be included.
-///
-/// Each iteration queries the database by height, so blocks are guaranteed
-/// to be in chain order.
+/// This iterator uses RocksDB's native `DBIterator` for efficient sequential access
+/// over the "blocks" column family. Blocks are automatically decrypted as they are
+/// yielded in ascending height order (0, 1, 2, ...).
 pub struct BlockIterator<'a> {
-    /// Reference to the blockchain database
-    db: &'a BlockChain,
-    /// Current position in the iteration
-    current_height: u64,
-    /// Maximum height to iterate to (inclusive)
-    max_height: u64,
+    /// Reference to the blockchain for decryption
+    blockchain: &'a BlockChain,
+    /// RocksDB iterator over the blocks column family
+    iter: rocksdb::DBIteratorWithThreadMode<'a, DB>,
 }
 
 impl<'a> Iterator for BlockIterator<'a> {
     type Item = Result<Block>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current_height > self.max_height {
-            return None;
-        }
+        match self.iter.next() {
+            Some(Ok((height_bytes, block_bytes))) => {
+                // Extract height from key
+                let mut height_arr = [0u8; 8];
+                height_arr.copy_from_slice(&height_bytes[..BLOCK_HEIGHT_SIZE]);
+                let height = u64::from_le_bytes(height_arr);
+                // Deserialize block and decrypt data
+                let block = (|| -> Result<Block> {
+                    if height
+                        != u64::from_le_bytes(block_bytes[0..BLOCK_HEIGHT_SIZE].try_into().unwrap())
+                    {
+                        return Err(anyhow!(
+                            "Block height mismatch: expected {}, got {}",
+                            height,
+                            u64::from_le_bytes(
+                                block_bytes[0..BLOCK_HEIGHT_SIZE].try_into().unwrap()
+                            )
+                        ));
+                    }
+                    let mut block = Block::from_bytes(&block_bytes)?;
+                    block.block_data = self.blockchain.decrypt_block_data(&block.block_data)?;
+                    Ok(block)
+                })();
 
-        let block = self.db.get_block_by_height(self.current_height);
-        self.current_height += 1;
-
-        match block {
-            Ok(b) => Some(Ok(b)),
-            Err(e) => Some(Err(e)),
+                Some(block)
+            }
+            Some(Err(e)) => Some(Err(anyhow!("RocksDB iterator error: {}", e))),
+            None => None,
         }
     }
 }

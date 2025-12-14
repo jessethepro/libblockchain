@@ -1,22 +1,14 @@
-//! Database configuration and models for SledDB and RocksDB
+//! Database configuration and models for RocksDB
 //!
 //! This module defines configuration structures for creating and managing
-//! embedded database instances. Supports both Sled (pure Rust) and RocksDB
-//! (C++ based) for persistent blockchain storage.
+//! RocksDB embedded database instances for persistent blockchain storage.
 //!
 //! # Features
 //!
 //! - **Configuration presets**: Pre-configured settings for common use cases
 //! - **Builder pattern**: Fluent API for custom configurations
 //! - **Serializable**: All configurations can be serialized with serde
-//! - **Dual database support**: Choose between SledDB or RocksDB
-//!
-//! # SledDB Presets
-//!
-//! - [`SledDb::high_performance()`]: Optimized for speed (large cache, async flush)
-//! - [`SledDb::high_durability()`]: Optimized for safety (sync flush, compression)
-//! - [`SledDb::temporary()`]: In-memory database deleted on close
-//! - [`SledDb::read_only()`]: Read-only access to existing database
+//! - **Column family support**: Organize data into separate logical tables
 //!
 //! # RocksDB Presets
 //!

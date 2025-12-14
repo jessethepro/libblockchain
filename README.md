@@ -9,8 +9,8 @@ A generic, lightweight Rust library for creating and managing blockchain blocks 
 - **Automatic height management**: Heights assigned automatically with thread-safe Mutex protection
 - **Hybrid encryption**: RSA + AES-256-GCM encryption for block data
 - **Secure key storage**: Private keys protected with `secrecy` crate, auto-extracts public keys
-- **UUID-based indexing**: Efficient block lookup by UUID or height
-- **Iterator support**: Traverse blocks in chain order
+- **Height-based indexing**: Efficient block lookup by height
+- **Native RocksDB iterator**: Efficient traversal using RocksDB's built-in iteration
 - **Configurable database**: Multiple RocksDB presets (high performance, high durability, read-only)
 - **Type-safe**: Strong typing with clear separation between cryptographic and metadata concerns
 - **SHA-512 hashing**: 64-byte cryptographic hashes for block integrity
@@ -23,6 +23,19 @@ Add this to your `Cargo.toml`:
 [dependencies]
 libblockchain = { git = "https://github.com/jessethepro/libblockchain.git" }
 ```
+
+### Build Notes
+
+**Important**: This library compiles RocksDB and OpenSSL from source:
+- **RocksDB**: Compiled with `mt_static` feature (multi-threaded static linking)
+- **OpenSSL**: Compiled with `vendored` feature (builds from source)
+
+The first build may take **5-10 minutes** due to C++ compilation. You'll need:
+- C++ compiler (g++ or clang)
+- CMake (for RocksDB)
+- Standard build tools (make, etc.)
+
+Subsequent builds are faster as dependencies are cached.
 
 ## Quick Start
 
@@ -59,9 +72,8 @@ chain.validate()?;
 
 ## Architecture
 - **`blockchain`**: Persistent blockchain storage with RocksDB
-  - Automatic height management with Mutex-protected counter
-  - UUID-based block storage with separate height index
-  - Iterator support for traversing blocks in order
+  - Height-based block storage (blocks keyed by u64 height)
+  - Native RocksDB iterator for efficient sequential access
   - Integrated hybrid RSA-OAEP + AES-256-GCM encryption
   - Private keys protected using `secrecy` crate with automatic zeroing
   - Automatic public key extraction from private keys
@@ -78,18 +90,18 @@ chain.validate()?;
 
 ### Database Structure
 
-The blockchain uses two RocksDB column families:
-- **`blocks`**: Maps block UUID (16 bytes) → serialized Block data
-- **`height`**: Maps block height (u64 as big-endian bytes) → block UUID
+The blockchain uses one RocksDB column family:
+- **`blocks`**: Maps block height (u64 as little-endian bytes) → encrypted Block data
 
+**Key Design Decisions:**
 - **Opaque data**: `block_data: Vec<u8>` allows any application-specific payload
-- **Hybrid encryption**: AES-256-GCM for data, RSA-OAEP for key encryption
+- **Selective encryption**: Only `block_data` is encrypted; BlockHeader and hash stored in plaintext
+- **Hybrid encryption**: AES-256-GCM for data, RSA-OAEP for AES key encapsulation
+- **Private key required**: Application's private key needed to decrypt the encrypted AES key
 - **Secure key management**: Private keys protected with `secrecy` crate, zeroed on drop
 - **Interactive security**: Password prompting for encrypted private keys
-- **Block height is automatic**: Managed internally by the blockchain, not passed by users
-- **UUID-based storage**: Blocks stored by UUID for efficient direct lookup
-- **Height index**: Separate index for sequential access and iteration
-- **Mutex-protected height**: Thread-safe concurrent block insertion
+- **Height-based storage**: Blocks keyed directly by height for efficient sequential access
+- **Automatic height assignment**: Heights managed internally, assigned sequentially
 
 ## Usage Examples
 ### Creating a Blockchain
@@ -137,15 +149,9 @@ let block5 = chain.get_block_by_height(5)?;
 // Access decrypted data directly
 println!("Genesis data: {:?}", String::from_utf8_lossy(&genesis.block_data));
 
-// By UUID
-let uuid = genesis.block_header.block_uid;
-let same_block = chain.get_block_by_uuid(&uuid)?;
-
-// Latest block
-let latest = chain.get_latest_block()?;
-
-// Check existence
-let exists = chain.block_exists(&uuid)?;
+// Get maximum height
+let max_height = chain.get_max_height()?;
+let latest = chain.get_block_by_height(max_height)?;
 ### Iterating Over Blocks
 
 ```rust
@@ -224,39 +230,41 @@ println!("Transaction: {} -> {}, amount: {}", tx.from, tx.to, tx.amount);
 
 **Querying:**
 - `get_block_by_height(&self, height: u64) -> Result<Block>`: Get block by height (automatically decrypted)
-- `get_block_by_uuid(&self, uuid: &[u8; 16]) -> Result<Option<Block>>`: Get block by UUID
-- `get_latest_block(&self) -> Result<Block>`: Get most recent block
-- `block_exists(&self, uuid: &[u8; 16]) -> Result<bool>`: Check if block exists
-- `block_count(&self) -> Result<usize>`: Get total block count
-- `get_height(&self) -> Result<u64>`: Get height of last block
+- `get_max_height(&self) -> Result<u64>`: Get height of last block
+- `block_count(&self) -> Result<u64>`: Get total block count
+- `delete_latest_block(&self) -> Result<Option<u64>>`: Delete the most recently inserted block
 
 **Validation:**
 - `validate(&self) -> Result<()>`: Validate entire blockchain integrity
 
 **Iteration:**
-- `iter(&self) -> BlockIterator<'_>`: Create iterator over all blocks (automatically decrypts)
+- `iter(&self) -> BlockIterator<'_>`: Create RocksDB-backed iterator over all blocks (automatically decrypts)
+
+### `Block`
+
 ```rust
 pub struct Block {
     pub block_header: BlockHeader,
     pub block_hash: [u8; 64],        // SHA-512 hash (64 bytes)
     pub block_data: Vec<u8>,         // Application data (decrypted when retrieved)
-    pub block_signature: Vec<u8>,
 }
 ```
 
 **Methods:**
-- `new_genesis_block(data: Vec<u8>) -> Self`: Create genesis block
-- `new_regular_block(parent_hash: [u8; 64], data: Vec<u8>) -> Self`: Create regular block  
+- `new_genesis_block(data: Vec<u8>) -> Self`: Create genesis block (height 0)
+- `new_regular_block(height: u64, parent_hash: [u8; 64], data: Vec<u8>) -> Self`: Create regular block with specified height  
 - `bytes(&self) -> Vec<u8>`: Serialize block to bytes
 - `from_bytes(bytes: &[u8]) -> Result<Self>`: Deserialize block from bytes
 ```
+### `BlockHeader`
+
 ```rust
 pub struct BlockHeader {
-    pub block_uid: uuid::Bytes,      // 16-byte UUID
+    pub height: u64,                  // Block height in chain
+    pub block_uid: [u8; 16],         // 16-byte UUID
     pub version: u32,                 // Header version (currently 1)
     pub parent_hash: [u8; 64],       // SHA-512 hash of parent block
-    pub timestamp: u64,               // Unix timestamp
-    pub nonce: u64,                   // Random nonce
+    pub timestamp: u64,               // Unix timestamp (seconds since epoch)
 }
 ```
 
@@ -295,9 +303,9 @@ All tests passing ✓
 ## Thread Safety
 
 `BlockChain` is safe to share across threads:
-- The `current_height` field is protected by a `Mutex`
-- SledDB is internally lock-free and thread-safe
-- Multiple threads can safely insert blocks concurrently
+- RocksDB is thread-safe with Arc-wrapped database instance
+- Multiple threads can safely read blocks concurrently
+- Write operations are serialized by RocksDB's internal locking
 ## Security
 
 - All block data is encrypted using hybrid RSA + AES-256-GCM encryption
@@ -310,11 +318,11 @@ All tests passing ✓
 
 ## Security
 
-- All block data is encrypted using hybrid RSA + AES-256-GCM encryption
+- All block data is encrypted using hybrid RSA-OAEP + AES-256-GCM encryption
 - AES-GCM provides authenticated encryption (detects tampering)
-- RSA-OAEP for secure key encapsulation
+- RSA-OAEP (SHA-256 MGF1) for secure AES key encapsulation
 - Random nonces ensure unique encryption per block
-- X509 certificates required for encryption operations
+- Private keys stored with automatic zeroing via `secrecy` crate
 
 ## Contributing
 

@@ -7,6 +7,15 @@
 //! - Automatic height and parent relationship management
 //! - Interactive password prompting for encrypted private keys
 //!
+//! # Build Dependencies
+//!
+//! **Note**: This library compiles RocksDB and OpenSSL from source during the build process:
+//! - **RocksDB**: Built with `mt_static` feature for multi-threaded static linking
+//! - **OpenSSL**: Built with `vendored` feature to compile from source
+//!
+//! The first build may take several minutes due to C++ compilation. Subsequent builds
+//! will be faster as dependencies are cached.
+//!
 //! # Architecture
 //!
 //! The library is designed to be data-agnostic - the actual payload stored in blocks
@@ -66,10 +75,11 @@
 //! # Design Decisions
 //!
 //! - **Data-agnostic**: Block data is `Vec<u8>` - applications define the payload structure
-//! - **UUID-based storage**: Blocks stored by UUID, with separate height index
-//! - **Automatic height management**: Heights assigned automatically on insertion
-//! - **Thread-safe**: Mutex-protected height counter for concurrent access
+//! - **Height-based storage**: Blocks keyed directly by height for efficient sequential access
+//! - **Automatic height management**: Heights assigned automatically and stored in BlockHeader
+//! - **Thread-safe**: RocksDB Arc-wrapped database with internal locking
 //! - **Integrated encryption**: Encryption/decryption happens transparently in blockchain layer
+//! - **Native RocksDB iteration**: Efficient block traversal using RocksDB's iterator
 //!
 
 pub mod block;

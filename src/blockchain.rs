@@ -273,7 +273,7 @@ impl BlockChain {
         Ok(block.block_header.height)
     }
 
-    pub fn put_signature(&self, height: u64, signature: Vec<u8>) -> Result<()> {
+    pub fn put_signature(&self, height: u64, signature: Vec<u8>) -> Result<u64> {
         let signatures_cf = self
             .db
             .cf_handle("signatures")
@@ -281,7 +281,7 @@ impl BlockChain {
         self.db
             .put_cf(signatures_cf, height.to_le_bytes(), &signature)
             .map_err(|e| anyhow!("Failed to insert signature: {}", e))?;
-        Ok(())
+        Ok(height)
     }
 
     /// Retrieve a block by its height in the chain

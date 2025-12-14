@@ -273,6 +273,17 @@ impl BlockChain {
         Ok(block.block_header.height)
     }
 
+    pub fn put_signature(&self, height: u64, signature: Vec<u8>) -> Result<()> {
+        let signatures_cf = self
+            .db
+            .cf_handle("signatures")
+            .ok_or_else(|| anyhow!("Failed to get signatures column family"))?;
+        self.db
+            .put_cf(signatures_cf, height.to_le_bytes(), &signature)
+            .map_err(|e| anyhow!("Failed to insert signature: {}", e))?;
+        Ok(())
+    }
+
     /// Retrieve a block by its height in the chain
     ///
     /// # Arguments
@@ -304,6 +315,19 @@ impl BlockChain {
             Ok(block)
         })()?;
         Ok(block)
+    }
+
+    pub fn get_signature_by_height(&self, height: u64) -> Result<Vec<u8>> {
+        let signatures_cf = self
+            .db
+            .cf_handle("signatures")
+            .ok_or_else(|| anyhow!("Failed to get signatures column family"))?;
+        let signature = self
+            .db
+            .get_cf(signatures_cf, height.to_le_bytes())
+            .map_err(|e| anyhow!("Failed to get signature by height: {}", e))?
+            .ok_or_else(|| anyhow!("No signature found at height {}", height))?;
+        Ok(signature)
     }
 
     fn decrypt_block_data(&self, encrypted_block_data: &[u8]) -> Result<Vec<u8>> {

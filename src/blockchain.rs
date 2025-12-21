@@ -535,6 +535,10 @@ impl BlockChain {
         Ok(Some(block_count - 1))
     }
 
+    pub fn get_private_key(&self) -> Vec<u8> {
+        self.private_key.expose_secret().der_bytes.clone()
+    }
+
     /// Get the total number of blocks stored in the blockchain
     ///
     /// # Returns

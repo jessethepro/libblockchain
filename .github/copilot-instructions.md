@@ -3,26 +3,26 @@
 ## Project Overview
 A **generic, data-agnostic blockchain library** with persistent storage, hybrid encryption, and secure key management. The library provides infrastructure for blockchain operations while remaining agnostic to payload content. Applications define what data goes in `block_data: Vec<u8>`.
 
-**Recent Activity**: Successfully migrated from SledDB to RocksDB (December 2025).
+**Tech Stack**: Rust (edition 2024), RocksDB (persistent storage), OpenSSL (cryptography), `secrecy` crate (key protection)  
+**Recent Activity**: Successfully migrated from SledDB to RocksDB (December 2025)
 
 ## Architecture
 
 ### Core Components
 - **[src/block.rs](src/block.rs)**: Block structures with SHA-512 hashing (64-byte hashes)
-  - `BlockHeader`: Cryptographic data (UUID, version, parent_hash, timestamp, nonce) - 100 bytes fixed
+  - `BlockHeader`: Cryptographic data (height, UUID, version, parent_hash, timestamp) - 100 bytes fixed
   - `Block`: Complete block with header, hash, and encrypted data payload
-  - Block height is **NOT in the header** - managed automatically by `BlockChain` as database metadata
+  - Block height **IS in the header** - stored as part of block metadata, assigned on `put_block()`
   - Uses `openssl::hash::hash(MessageDigest::sha512(), ...)` for block hashing
 
 - **[src/blockchain.rs](src/blockchain.rs)**: RocksDB-backed persistent storage with integrated encryption
-  - Two RocksDB column families: `blocks` (UUID → block), `height` (u64 → UUID)
-  - Mutex-protected `current_height` counter for thread-safe concurrent inserts
+  - Two RocksDB column families: `blocks` (height u64 → encrypted block), `signatures` (height u64 → signature)
   - Database wrapped in `Arc<DB>` for thread-safe sharing
   - **Hybrid encryption**: AES-256-GCM for block data, RSA-OAEP for key encapsulation
   - Private keys wrapped in `SecretBox<SecurePrivateKey>` (implements `Zeroize`)
   - Interactive password prompting for encrypted PEM files via `rpassword`
   - Public key automatically extracted from private key on initialization
-  - Storage format: `[key_len(4)] || [RSA(AES_key)(var)] || [nonce(12)] || [tag(16)] || [block_len(4)] || [AES(Block)(var)]`
+  - Storage format: `[key_len(4)] || [RSA(AES_key)(var)] || [nonce(12)] || [tag(16)] || [data_len(4)] || [AES(Block)(var)]`
 
 - **[src/db_model.rs](src/db_model.rs)**: RocksDB configuration with presets
   - Presets: `high_performance()`, `high_durability()`, `read_only()`
@@ -33,8 +33,8 @@ A **generic, data-agnostic blockchain library** with persistent storage, hybrid 
 
 ### Key Design Decisions
 - **Data-agnostic**: `block_data: Vec<u8>` - applications define the payload structure
-- **UUID-based storage**: Blocks stored by UUID (16 bytes) with separate height column family for sequential access
-- **Automatic height management**: Heights assigned on `put_block()`, incremented atomically
+- **Height-based storage**: Blocks stored by height (u64 as little-endian bytes) as primary key
+- **Automatic height management**: Heights assigned on `put_block()` by counting existing blocks
 - **Transparent encryption**: Encrypt on write, decrypt on read - users see plaintext `block_data`
 - **Security by default**: All block data encrypted with unique AES-256-GCM keys per block
 - **Column families**: RocksDB's equivalent of "tables" - accessed via `cf_handle()`
@@ -47,7 +47,7 @@ A **generic, data-agnostic blockchain library** with persistent storage, hybrid 
 const BLOCK_VERSION: u32 = 1;
 const BLOCK_UID_SIZE: usize = 16;        // UUID bytes
 const BLOCK_HASH_SIZE: usize = 64;       // SHA-512 hash
-const BLOCK_HEADER_SIZE: usize = 100;    // uid(16) + version(4) + parent(64) + time(8) + nonce(8)
+const BLOCK_HEADER_SIZE: usize = 100;    // height(8) + uid(16) + version(4) + parent(64) + timestamp(8)
 
 // Encryption (src/blockchain.rs)
 const AES_GCM_256_KEY_SIZE: usize = 32;  // 256-bit AES key
@@ -62,14 +62,19 @@ const AES_GCM_TAG_SIZE: usize = 16;      // 128-bit auth tag
 // Initialization & insertion
 BlockChain::new(path, private_key_path)  // Opens/creates blockchain, prompts for password
 .put_block(data: Vec<u8>)                // Insert block with automatic height assignment
+.put_signature(height, signature)        // Store signature for block at height
 
 // Querying
 .get_block_by_height(height: u64)        // Retrieve by height (0-indexed)
-.get_block_by_uuid(&uuid)                // Retrieve by UUID, returns Option<Block>
-.get_latest_block()                      // Get highest height block
-.get_height()                            // Get current height (next to be assigned)
+.get_signature_by_height(height: u64)    // Retrieve signature for block
+.get_latest_block()                      // Get most recent block (shorthand for max_height)
+.get_max_height()                        // Get height of last block (or 0 for empty)
 .block_count()                           // Total blocks in chain
-.block_exists(&uuid)                     // Check UUID existence
+.delete_latest_block()                   // Delete most recent block
+
+// Mode switching
+.into_read_only()                        // Convert to read-only (preserves keys, no password reprompt)
+.into_read_write()                       // Convert back to read-write mode
 
 // Validation & iteration
 .validate()                              // Verify entire chain integrity (parent hashes)
@@ -80,11 +85,13 @@ BlockChain::new(path, private_key_path)  // Opens/creates blockchain, prompts fo
 
 ### Build & Test
 ```bash
-cargo build                    # Compile library
-cargo test                     # Run unit tests (db_model has tests)
+cargo build                    # First build takes 5-10 min (compiles RocksDB + OpenSSL)
+cargo test                     # Run unit tests (currently none exist)
 cargo doc --open               # View documentation
 cargo check                    # Fast type checking
 ```
+
+**Build Requirements**: C++ compiler (g++/clang), CMake, make. RocksDB and OpenSSL compile from source via `vendored` and `mt_static` features.
 
 ### Testing Private Key Encryption
 The library prompts for passwords at runtime. Generate test keys:
@@ -103,18 +110,18 @@ openssl genrsa -out test_key_nopass.pem 4096
 use rocksdb::{DB, IteratorMode, Options};
 let mut opts = Options::default();
 opts.create_if_missing(false);
-let db = DB::open_cf(&opts, "./my_blockchain", &["blocks", "height"])?;
+let db = DB::open_cf(&opts, "./my_blockchain", &["blocks", "signatures"])?;
 let blocks_cf = db.cf_handle("blocks").unwrap();
-let height_cf = db.cf_handle("height").unwrap();
+let signatures_cf = db.cf_handle("signatures").unwrap();
 ```
 
 ## Code Conventions
 
 ### Serialization Format
 ```rust
-// BlockHeader (100 bytes): uid(16) || version(4) || parent_hash(64) || timestamp(8) || nonce(8)
+// BlockHeader (100 bytes): height(8) || uid(16) || version(4) || parent_hash(64) || timestamp(8)
 // Block: header(100) || block_hash(64) || data_len(4) || block_data(var)
-// Stored (encrypted): key_len(4) || RSA(AES_key)(var) || nonce(12) || tag(16) || block_len(4) || AES(Block)(var)
+// Stored (encrypted): key_len(4) || RSA(AES_key)(var) || nonce(12) || tag(16) || data_len(4) || AES(Block)(var)
 ```
 
 ### Error Handling
@@ -152,10 +159,10 @@ let height_cf = db.cf_handle("height").unwrap();
 
 ## Common Pitfalls
 - **Don't access `block_data` before decryption**: `BlockChain` methods handle encryption/decryption transparently
-- **Don't store height in `BlockHeader`**: Height is database metadata managed by `current_height` Mutex, NOT part of block structure
+- **Don't modify height in `BlockHeader` manually**: Height is assigned automatically by `put_block()` based on block count
 - **Don't call `Block::bytes()` on encrypted blocks**: Hashing happens in `BlockHeader` before encryption
 - **Parent hash validation**: Genesis block has `parent_hash = [0u8; 64]`, not empty slice or Option
-- **Thread safety**: Database already wrapped in `Arc<DB>`, `current_height` is Mutex-protected
+- **Thread safety**: Database already wrapped in `Arc<DB>` for multi-threaded access
 - **Column family handles**: Always check `cf_handle()` returns `Some` before using - panic if None
 - **Iterator sizing**: RocksDB iterators return `Box<[u8]>`, not `&[u8]` - copy to fixed-size arrays
 - **Edition 2024**: Cargo.toml uses `edition = "2024"` - may require nightly Rust or recent stable (1.85+)
@@ -163,7 +170,7 @@ let height_cf = db.cf_handle("height").unwrap();
 
 ## Incomplete/Future Work
 - **No integration tests**: `tests/` directory exists but is empty - add tests that use real encrypted blocks
-- **No consensus mechanism**: PoW/PoS not implemented - nonce field exists in BlockHeader but unused
+- **No consensus mechanism**: PoW/PoS not implemented - library is purely for data persistence, not mining
 - **No network layer**: Purely local storage, no P2P or synchronization
 - **No block validation hooks**: Applications can't inject custom validation rules
 - **Iterator limitations**: No reverse iteration, filtering, or seeking to specific heights

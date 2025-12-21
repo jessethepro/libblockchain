@@ -1,3 +1,6 @@
+#![warn(clippy::unwrap_used)]
+#![warn(clippy::indexing_slicing)]
+
 //! A generic blockchain library for creating and managing blockchain blocks
 //!
 //! This library provides core blockchain primitives including:

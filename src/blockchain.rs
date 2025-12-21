@@ -83,6 +83,11 @@ impl fmt::Debug for SecurePrivateKey {
             .finish()
     }
 }
+#[derive(PartialEq, Eq)]
+pub(crate) enum Mode {
+    ReadOnly,
+    ReadWrite,
+}
 pub struct BlockChain {
     /// RocksDB database instance
     db: std::sync::Arc<DB>,
@@ -92,6 +97,8 @@ pub struct BlockChain {
 
     /// Public key for encrypting block data
     pub public_key: PKey<openssl::pkey::Public>,
+
+    mode: Mode,
 }
 
 impl BlockChain {
@@ -166,6 +173,83 @@ impl BlockChain {
                 der_bytes: private_key_der,
             })),
             public_key,
+            mode: Mode::ReadWrite,
+        })
+    }
+
+    /// Convert this blockchain into read-only mode
+    ///
+    /// Consumes the current instance, closes the database, and reopens it
+    /// in read-only mode. The private and public keys are preserved without
+    /// re-prompting for passwords.
+    ///
+    /// # Arguments
+    /// * `path` - Path to the database directory
+    ///
+    /// # Returns
+    /// A new `BlockChain` instance opened in read-only mode
+    ///
+    /// # Errors
+    /// Returns an error if the database cannot be reopened in read-only mode
+    pub fn into_read_only(self) -> Result<Self> {
+        // Extract keys before dropping db
+        let private_key = self.private_key;
+        let public_key = self.public_key;
+        let path = self.db.path().to_path_buf();
+
+        // Drop the database to close it
+        drop(self.db);
+
+        // Reopen in read-only mode
+        let db = RocksDbModel::read_only(path)
+            .with_column_family("blocks")
+            .with_column_family("signatures")
+            .open()
+            .map_err(|e| anyhow!("Failed to open RocksDB in read-only mode: {}", e))?;
+
+        Ok(Self {
+            db: std::sync::Arc::new(db),
+            private_key,
+            public_key,
+            mode: Mode::ReadOnly,
+        })
+    }
+
+    /// Convert this blockchain into read-write mode
+    ///
+    /// Consumes the current instance, closes the database, and reopens it
+    /// in read-write mode. The private and public keys are preserved without
+    /// re-prompting for passwords.
+    ///
+    /// # Arguments
+    /// * `path` - Path to the database directory
+    ///
+    /// # Returns
+    /// A new `BlockChain` instance opened in read-write mode
+    ///
+    /// # Errors
+    /// Returns an error if the database cannot be reopened in read-write mode
+    pub fn into_read_write(self) -> Result<Self> {
+        // Extract keys before dropping db
+        let private_key = self.private_key;
+        let public_key = self.public_key;
+        let path = self.db.path().to_path_buf();
+
+        // Drop the database to close it
+        drop(self.db);
+
+        // Reopen in read-write mode
+        let db = RocksDbModel::new(path)
+            .with_column_family("blocks")
+            .with_column_family("signatures")
+            .open()
+            .map_err(|e| anyhow!("Failed to open RocksDB in read-write mode: {}", e))?;
+
+        Ok(Self {
+            db: std::sync::Arc::new(db),
+            private_key,
+            public_key,
+            mode: Mode::ReadWrite,
         })
     }
 

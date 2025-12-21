@@ -326,11 +326,10 @@ impl RocksDbModel {
             opts.enable_statistics();
         }
 
-        if self.optimize_for_point_lookup {
-            if let Some(cache_size) = self.block_cache_size {
+        if self.optimize_for_point_lookup
+            && let Some(cache_size) = self.block_cache_size {
                 opts.optimize_for_point_lookup(cache_size as u64);
             }
-        }
 
         // Open database with column families
         if self.read_only {

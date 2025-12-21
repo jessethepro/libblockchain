@@ -34,7 +34,7 @@
 //! The database is Arc-wrapped and thread-safe. RocksDB handles concurrent
 //! reads efficiently, while writes are serialized internally.
 
-use crate::block::{BLOCK_HASH_SIZE, BLOCK_HEIGHT_SIZE, BLOCK_UID_SIZE, Block};
+use crate::block::{BLOCK_HASH_SIZE, BLOCK_HEIGHT_SIZE, Block};
 use crate::db_model::RocksDbModel;
 use anyhow::{Context, Result, anyhow};
 use openssl::hash::MessageDigest;
@@ -98,6 +98,7 @@ pub struct BlockChain {
     /// Public key for encrypting block data
     pub public_key: PKey<openssl::pkey::Public>,
 
+    #[allow(dead_code)]
     mode: Mode,
 }
 
@@ -346,7 +347,7 @@ impl BlockChain {
             .cf_handle("blocks")
             .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
         self.db
-            .put_cf(blocks_cf, height.to_le_bytes(), &block.bytes())
+            .put_cf(blocks_cf, height.to_le_bytes(), block.bytes())
             .map_err(|e| anyhow!("Failed to insert block: {}", e))?;
 
         // Flush to ensure durability
@@ -387,11 +388,17 @@ impl BlockChain {
                 .get_cf(blocks_cf, height.to_le_bytes())
                 .map_err(|e| anyhow!("Failed to get block by height: {}", e))?
                 .ok_or_else(|| anyhow!("No block found at height {}", height))?;
-            if height != u64::from_le_bytes(block_bytes[0..BLOCK_HEIGHT_SIZE].try_into().unwrap()) {
+            let stored_height = u64::from_le_bytes(
+                block_bytes
+                    .get(0..BLOCK_HEIGHT_SIZE)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(|| anyhow!("Failed to read height from stored block"))?,
+            );
+            if height != stored_height {
                 return Err(anyhow!(
                     "Block height mismatch: expected {}, got {}",
                     height,
-                    u64::from_le_bytes(block_bytes[0..BLOCK_HEIGHT_SIZE].try_into().unwrap())
+                    stored_height
                 ));
             }
             let mut block = Block::from_bytes(&block_bytes)?;
@@ -417,25 +424,34 @@ impl BlockChain {
     fn decrypt_block_data(&self, encrypted_block_data: &[u8]) -> Result<Vec<u8>> {
         let mut index = 0;
         let aes_key_len = u32::from_le_bytes(
-            // u32 for the length of the encrypted AES key
-            encrypted_block_data[index..index + AES_KEY_LEN_SIZE]
-                .try_into()
-                .unwrap(),
+            encrypted_block_data
+                .get(index..index + AES_KEY_LEN_SIZE)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| anyhow!("Failed to read AES key length"))?,
         ) as usize;
         index += AES_KEY_LEN_SIZE;
-        let encrypted_aes_key = &encrypted_block_data[index..index + aes_key_len];
+        let encrypted_aes_key = encrypted_block_data
+            .get(index..index + aes_key_len)
+            .ok_or_else(|| anyhow!("Failed to read encrypted AES key"))?;
         index += aes_key_len;
-        let nonce = &encrypted_block_data[index..index + AES_GCM_NONCE_SIZE];
+        let nonce = encrypted_block_data
+            .get(index..index + AES_GCM_NONCE_SIZE)
+            .ok_or_else(|| anyhow!("Failed to read nonce"))?;
         index += AES_GCM_NONCE_SIZE;
-        let tag = &encrypted_block_data[index..index + AES_GCM_TAG_SIZE];
+        let tag = encrypted_block_data
+            .get(index..index + AES_GCM_TAG_SIZE)
+            .ok_or_else(|| anyhow!("Failed to read authentication tag"))?;
         index += AES_GCM_TAG_SIZE;
         let data_len = u32::from_le_bytes(
-            encrypted_block_data[index..index + DATA_LEN_SIZE]
-                .try_into()
-                .unwrap(),
+            encrypted_block_data
+                .get(index..index + DATA_LEN_SIZE)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| anyhow!("Failed to read data length"))?,
         ) as usize;
         index += DATA_LEN_SIZE;
-        let data_bytes = &encrypted_block_data[index..index + data_len];
+        let data_bytes = encrypted_block_data
+            .get(index..index + data_len)
+            .ok_or_else(|| anyhow!("Failed to read encrypted data"))?;
         let decrypted_data = {
             // Decrypt AES key with RSA-OAEP
             let aes_key = (|| -> Result<Vec<u8>> {
@@ -454,7 +470,8 @@ impl BlockChain {
             })()?;
 
             // Decrypt block data with AES-GCM
-            let decrypted_data = openssl::symm::decrypt_aead(
+
+            openssl::symm::decrypt_aead(
                 Cipher::aes_256_gcm(),
                 &aes_key,
                 Some(nonce),
@@ -462,8 +479,7 @@ impl BlockChain {
                 data_bytes,
                 tag,
             )
-            .map_err(|e| anyhow!("AES-GCM decryption failed: {}", e))?;
-            decrypted_data
+            .map_err(|e| anyhow!("AES-GCM decryption failed: {}", e))?
         };
         Ok(decrypted_data)
     }
@@ -642,19 +658,25 @@ impl<'a> Iterator for BlockIterator<'a> {
             Some(Ok((height_bytes, block_bytes))) => {
                 // Extract height from key
                 let mut height_arr = [0u8; 8];
-                height_arr.copy_from_slice(&height_bytes[..BLOCK_HEIGHT_SIZE]);
+                if let Some(slice) = height_bytes.get(..BLOCK_HEIGHT_SIZE) {
+                    height_arr.copy_from_slice(slice);
+                } else {
+                    return Some(Err(anyhow!("Invalid height key in database")));
+                }
                 let height = u64::from_le_bytes(height_arr);
                 // Deserialize block and decrypt data
                 let block = (|| -> Result<Block> {
-                    if height
-                        != u64::from_le_bytes(block_bytes[0..BLOCK_HEIGHT_SIZE].try_into().unwrap())
-                    {
+                    let stored_height = u64::from_le_bytes(
+                        block_bytes
+                            .get(0..BLOCK_HEIGHT_SIZE)
+                            .and_then(|s| s.try_into().ok())
+                            .ok_or_else(|| anyhow!("Failed to read height from block"))?,
+                    );
+                    if height != stored_height {
                         return Err(anyhow!(
                             "Block height mismatch: expected {}, got {}",
                             height,
-                            u64::from_le_bytes(
-                                block_bytes[0..BLOCK_HEIGHT_SIZE].try_into().unwrap()
-                            )
+                            stored_height
                         ));
                     }
                     let mut block = Block::from_bytes(&block_bytes)?;

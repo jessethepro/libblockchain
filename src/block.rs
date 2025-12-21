@@ -72,20 +72,24 @@ impl BlockHeader {
             .expect("Time went backwards")
             .as_secs();
         let header = Self {
-            height: height,
+            height,
             block_uid,
             version,
             parent_hash,
             timestamp,
         };
-        let block_hash = (|| {
+        let block_hash = {
             let hash_vec = openssl::hash::hash(MessageDigest::sha512(), &header.bytes())
                 .expect("SHA-512 hashing failed")
                 .to_vec();
             let mut hash = [0u8; BLOCK_HASH_SIZE];
-            hash.copy_from_slice(&hash_vec[..BLOCK_HASH_SIZE]);
+            hash.copy_from_slice(
+                hash_vec
+                    .get(..BLOCK_HASH_SIZE)
+                    .expect("SHA-512 hash should be 64 bytes"),
+            );
             hash
-        })();
+        };
         (header, block_hash)
     }
 
@@ -105,28 +109,41 @@ impl BlockHeader {
         }
         let mut index = 0;
 
-        let height = u64::from_le_bytes(data[index..index + BLOCK_HEIGHT_SIZE].try_into().unwrap());
+        let height = u64::from_le_bytes(
+            data.get(index..index + BLOCK_HEIGHT_SIZE)
+                .and_then(|s| s.try_into().ok())
+                .expect("Failed to read height from block header"),
+        );
         index += BLOCK_HEIGHT_SIZE;
 
         let block_uid = {
             let mut uid = [0u8; BLOCK_UID_SIZE];
-            uid.copy_from_slice(&data[index..index + BLOCK_UID_SIZE]);
+            uid.copy_from_slice(
+                data.get(index..index + BLOCK_UID_SIZE)
+                    .expect("Failed to read block_uid from header"),
+            );
             index += BLOCK_UID_SIZE;
             uid
         };
-        let version =
-            u32::from_le_bytes(data[index..index + BLOCK_VERSION_SIZE].try_into().unwrap());
+        let version = u32::from_le_bytes(
+            data.get(index..index + BLOCK_VERSION_SIZE)
+                .and_then(|s| s.try_into().ok())
+                .expect("Failed to read version from block header"),
+        );
         index += BLOCK_VERSION_SIZE;
         let parent_hash = {
             let mut phash = [0u8; BLOCK_HASH_SIZE];
-            phash.copy_from_slice(&data[index..index + BLOCK_HASH_SIZE]);
+            phash.copy_from_slice(
+                data.get(index..index + BLOCK_HASH_SIZE)
+                    .expect("Failed to read parent_hash from header"),
+            );
             index += BLOCK_HASH_SIZE;
             phash
         };
         let timestamp = u64::from_le_bytes(
-            data[index..index + BLOCK_TIMESTAMP_SIZE]
-                .try_into()
-                .unwrap(),
+            data.get(index..index + BLOCK_TIMESTAMP_SIZE)
+                .and_then(|s| s.try_into().ok())
+                .expect("Failed to read timestamp from block header"),
         );
 
         Ok(BlockHeader {
@@ -159,7 +176,7 @@ impl BlockHeader {
             .expect("SHA-512 hashing failed")
             .to_vec();
         let mut hash = [0u8; 64];
-        hash.copy_from_slice(&hash_vec[..64]);
+        hash.copy_from_slice(hash_vec.get(..64).expect("SHA-512 hash should be 64 bytes"));
         hash
     }
 }
@@ -251,23 +268,35 @@ impl Block {
             return Err(anyhow!("Not enough data for header, hash, and length"));
         }
         // Deserialize header (100 bytes total)
-        let block_header = BlockHeader::new_from_bytes(&data[index..index + BLOCK_HEADER_SIZE])?;
+        let block_header = BlockHeader::new_from_bytes(
+            data.get(index..index + BLOCK_HEADER_SIZE)
+                .ok_or_else(|| anyhow!("Not enough data for block header"))?,
+        )?;
         index += BLOCK_HEADER_SIZE;
 
         // Deserialize block hash (64 bytes)
         let mut block_hash = [0u8; HASH_LEN];
-        block_hash.copy_from_slice(&data[index..index + HASH_LEN]);
+        block_hash.copy_from_slice(
+            data.get(index..index + HASH_LEN)
+                .ok_or_else(|| anyhow!("Not enough data for block hash"))?,
+        );
         index += HASH_LEN;
 
         // Deserialize block data length (4 bytes)
-        let data_len =
-            u32::from_le_bytes(data[index..index + DATA_LENGTH_LEN].try_into().unwrap()) as usize;
+        let data_len = u32::from_le_bytes(
+            data.get(index..index + DATA_LENGTH_LEN)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| anyhow!("Not enough data for block data length"))?,
+        ) as usize;
         index += DATA_LENGTH_LEN;
         if data.len() < index + data_len {
             return Err(anyhow!("Not enough space for block data")); // Not enough data for block data
         }
         // Deserialize block data
-        let block_data = data[index..index + data_len].to_vec();
+        let block_data = data
+            .get(index..index + data_len)
+            .ok_or_else(|| anyhow!("Not enough space for block data"))?
+            .to_vec();
         Ok(Block {
             block_header,
             block_hash,

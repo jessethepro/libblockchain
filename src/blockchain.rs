@@ -523,6 +523,13 @@ impl BlockChain {
                 self.db
                     .delete_cf(blocks_cf, (block_count - 1).to_le_bytes())
                     .map_err(|e| anyhow!("Failed to delete block: {}", e))?;
+                let signatures_cf = self
+                    .db
+                    .cf_handle("signatures")
+                    .ok_or_else(|| anyhow!("Failed to get signatures column family"))?;
+                self.db
+                    .delete_cf(signatures_cf, (block_count - 1).to_le_bytes())
+                    .map_err(|e| anyhow!("Failed to delete signature: {}", e))?;
             }
         }
         Ok(Some(block_count - 1))

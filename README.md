@@ -1,6 +1,6 @@
 # libblockchain
 
-A generic, lightweight Rust library for creating and managing blockchain blocks with persistent storage. This library provides core block structures, cryptographic primitives, and RocksDB-backed persistence while remaining agnostic to the actual data you store in blocks. To create or open a blockchain, the library requires the path to a Openssl RSA Private Key in PEM format. On Linux, I use the openssl command to generate a 4096 bit application key. The library will prompt the user for the password on the command line. The RSA Private Key file contains both the Private and Public keys and is used to encrypt/decrypt AES Keys. Unique AES GCM 256 bit keys are generated for each block transaction. Once the RSA Private Key file is loaded at application start, it can be removed from the file system and returned to its secure offline storage.
+A generic, lightweight Rust library for creating and managing blockchain blocks with persistent storage. This library provides core block structures, cryptographic primitives, and RocksDB-backed persistence while remaining agnostic to the actual data you store in blocks. To create or open a blockchain, applications must load an OpenSSL RSA private key (in `PKey<Private>` format) which can be read from PEM files. On Linux, use the `openssl` command to generate a 4096-bit key. The RSA private key is used to encrypt/decrypt unique AES-GCM-256 keys generated for each block. Once loaded into memory, the key file can be removed from the file system and returned to secure offline storage. The library automatically extracts the public key from the private key.
 
 ## Features
 
@@ -41,11 +41,16 @@ Subsequent builds are faster as dependencies are cached.
 
 ```rust
 use libblockchain::blockchain::BlockChain;
+use openssl::pkey::PKey;
+use std::fs;
+
+// Load private key from PEM file
+let key_pem = fs::read("./private_key.pem")?;
+let private_key = PKey::private_key_from_pem(&key_pem)?;
 
 // Create or open a blockchain with your private key
-// You'll be prompted for the password interactively
-// The public key is automatically extracted and stored
-let chain = BlockChain::new("./my_blockchain", "./private_key.pem")?;
+// The public key is automatically extracted
+let chain = BlockChain::new("./my_blockchain", private_key)?;
 
 // Insert blocks (automatically encrypted with AES-256-GCM + RSA-OAEP)
 chain.put_block(b"Genesis data".to_vec())?;
@@ -54,7 +59,8 @@ chain.put_block(b"Block 2 data".to_vec())?;
 
 // Query blocks (automatically decrypted)
 let genesis = chain.get_block_by_height(0)?;
-let latest = chain.get_latest_block()?;
+let max_height = chain.get_max_height()?;
+let latest = chain.get_block_by_height(max_height)?;
 let count = chain.block_count()?;
 
 // Access decrypted block data
@@ -122,8 +128,11 @@ let pem = private_key.private_key_to_pem_pkcs8_passphrase(
 )?;
 std::fs::write("./private_key.pem", pem)?;
 
-// Create blockchain (will prompt for password if key is encrypted)
-let chain = BlockChain::new("./my_blockchain", "./private_key.pem")?;
+// Later, load the key and create blockchain
+let key_pem = std::fs::read("./private_key.pem")?;
+let password = rpassword::prompt_password_stderr("Enter password: ")?;
+let private_key = PKey::private_key_from_pem_passphrase(&key_pem, password.as_bytes())?;
+let chain = BlockChain::new("./my_blockchain", private_key)?;
 
 ### Inserting Blocks
 
@@ -149,9 +158,11 @@ let block5 = chain.get_block_by_height(5)?;
 // Access decrypted data directly
 println!("Genesis data: {:?}", String::from_utf8_lossy(&genesis.block_data));
 
-// Get maximum height
+// Get latest block (no direct method, use this pattern)
 let max_height = chain.get_max_height()?;
-let latest = chain.get_block_by_height(max_height)?;
+if max_height > 0 {
+    let latest = chain.get_block_by_height(max_height)?;
+}
 ### Iterating Over Blocks
 
 ```rust

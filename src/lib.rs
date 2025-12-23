@@ -39,10 +39,16 @@
 //!
 //! ```no_run
 //! use libblockchain::blockchain::BlockChain;
+//! use openssl::pkey::PKey;
+//! use std::fs;
 //!
 //! # fn example() -> anyhow::Result<()> {
-//! // Create a blockchain with private key (prompts for password if encrypted)
-//! let chain = BlockChain::new("./my_blockchain", "./app_private_key.pem")?;
+//! // Load private key from PEM file
+//! let key_pem = fs::read("./app_private_key.pem")?;
+//! let private_key = PKey::private_key_from_pem(&key_pem)?;
+//!
+//! // Create blockchain with loaded private key
+//! let chain = BlockChain::new("./my_blockchain", private_key)?;
 //!
 //! // Insert blocks (automatically encrypted with AES-256-GCM + RSA-OAEP)
 //! chain.put_block(b"My genesis data".to_vec())?;
@@ -50,7 +56,8 @@
 //!
 //! // Query blocks (automatically decrypted)
 //! let genesis = chain.get_block_by_height(0)?;
-//! let latest = chain.get_latest_block()?;
+//! let max_height = chain.get_max_height()?;
+//! let latest = chain.get_block_by_height(max_height)?;
 //!
 //! // Access decrypted data directly
 //! println!("Genesis data: {:?}", String::from_utf8_lossy(&genesis.block_data));

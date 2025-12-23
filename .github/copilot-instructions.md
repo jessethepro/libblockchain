@@ -6,6 +6,8 @@ A **generic, data-agnostic blockchain library** with persistent storage, hybrid 
 **Tech Stack**: Rust (edition 2024), RocksDB (persistent storage), OpenSSL (cryptography), `secrecy` crate (key protection)  
 **Recent Activity**: Successfully migrated from SledDB to RocksDB (December 2025)
 
+**⚠️ Important Note**: The `BlockChain::new()` API takes `PKey<Private>` directly, NOT a file path. External code must load keys from PEM files first using OpenSSL functions.
+
 ## Architecture
 
 ### Core Components
@@ -60,20 +62,19 @@ const AES_GCM_TAG_SIZE: usize = 16;      // 128-bit auth tag
 ### BlockChain Operations
 ```rust
 // Initialization & insertion
-BlockChain::new(path, private_key_path)  // Opens/creates blockchain, prompts for password
-.put_block(data: Vec<u8>)                // Insert block with automatic height assignment
-.put_signature(height, signature)        // Store signature for block at height
+BlockChain::new(path, private_key: PKey<Private>)  // Opens/creates blockchain (key must be pre-loaded)
+.put_block(data: Vec<u8>)                          // Insert block with automatic height assignment
+.put_signature(height, signature)                  // Store signature for block at height
 
 // Querying
 .get_block_by_height(height: u64)        // Retrieve by height (0-indexed)
 .get_signature_by_height(height: u64)    // Retrieve signature for block
-.get_latest_block()                      // Get most recent block (shorthand for max_height)
 .get_max_height()                        // Get height of last block (or 0 for empty)
 .block_count()                           // Total blocks in chain
-.delete_latest_block()                   // Delete most recent block
+.delete_latest_block()                   // Delete most recent block (returns Option<u64>)
 
 // Mode switching
-.into_read_only()                        // Convert to read-only (preserves keys, no password reprompt)
+.into_read_only()                        // Convert to read-only (preserves keys)
 .into_read_write()                       // Convert back to read-write mode
 
 // Validation & iteration
@@ -89,18 +90,40 @@ cargo build                    # First build takes 5-10 min (compiles RocksDB + 
 cargo test                     # Run unit tests (currently none exist)
 cargo doc --open               # View documentation
 cargo check                    # Fast type checking
+cargo clippy                   # Lint checking (project uses clippy::unwrap_used & indexing_slicing warnings)
 ```
 
 **Build Requirements**: C++ compiler (g++/clang), CMake, make. RocksDB and OpenSSL compile from source via `vendored` and `mt_static` features.
 
+**Clippy Configuration**: Project enforces `#![warn(clippy::unwrap_used)]` and `#![warn(clippy::indexing_slicing)]` - use proper error handling and bounds checking.
+
 ### Testing Private Key Encryption
-The library prompts for passwords at runtime. Generate test keys:
+The library requires `PKey<Private>` instances. Generate test keys:
 ```bash
 # Generate RSA key (4096-bit recommended)
 openssl genrsa -aes256 -out test_key.pem 4096
 
 # Or unencrypted for testing
 openssl genrsa -out test_key_nopass.pem 4096
+```
+
+Load keys in Rust:
+```rust
+use openssl::pkey::PKey;
+use openssl::symm::Cipher;
+use std::fs;
+
+// For encrypted keys, use rpassword to prompt
+let key_pem = fs::read("test_key.pem")?;
+let password = rpassword::prompt_password_stderr("Enter password: ")?;
+let private_key = PKey::private_key_from_pem_passphrase(&key_pem, password.as_bytes())?;
+
+// For unencrypted keys
+let key_pem = fs::read("test_key_nopass.pem")?;
+let private_key = PKey::private_key_from_pem(&key_pem)?;
+
+// Then pass to BlockChain::new()
+let chain = BlockChain::new("./my_blockchain", private_key)?;
 ```
 
 ### Database Inspection
@@ -129,6 +152,9 @@ let signatures_cf = db.cf_handle("signatures").unwrap();
 - Add context with `.context("Description")` or `.with_context(|| format!("..."))`
 - Database operations should flush after inserts to ensure durability
 - Crypto errors propagate through `anyhow` with descriptive context
+- **Never use `.unwrap()`** - project enables `clippy::unwrap_used` warnings
+- Use `.ok_or_else(|| anyhow!(...))` for `Option` unwrapping
+- Use `.expect()` only for infallible operations with clear justification comments
 
 ### When Adding Features
 
@@ -166,13 +192,45 @@ let signatures_cf = db.cf_handle("signatures").unwrap();
 - **Column family handles**: Always check `cf_handle()` returns `Some` before using - panic if None
 - **Iterator sizing**: RocksDB iterators return `Box<[u8]>`, not `&[u8]` - copy to fixed-size arrays
 - **Edition 2024**: Cargo.toml uses `edition = "2024"` - may require nightly Rust or recent stable (1.85+)
-- **Password prompts**: `BlockChain::new()` calls `rpassword::prompt_password_stderr()` - cannot be automated in tests
+- **No `get_latest_block()` method**: The lib.rs and README examples incorrectly show this - use `get_block_by_height(get_max_height()?)` pattern
 
 ## Incomplete/Future Work
 - **No integration tests**: `tests/` directory exists but is empty - add tests that use real encrypted blocks
 - **No consensus mechanism**: PoW/PoS not implemented - library is purely for data persistence, not mining
 - **No network layer**: Purely local storage, no P2P or synchronization
 - **No block validation hooks**: Applications can't inject custom validation rules
+
+## Quick Reference Examples
+
+### Get Latest Block
+```rust
+// No direct .get_latest_block() method - use this pattern:
+let max_height = chain.get_max_height()?;
+if max_height > 0 {
+    let latest = chain.get_block_by_height(max_height)?;
+}
+```
+
+### Working with Column Families
+```rust
+// Always get CF handle before operations
+let blocks_cf = db.cf_handle("blocks")
+    .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
+
+// Use the handle for all CF operations
+db.put_cf(blocks_cf, key, value)?;
+let result = db.get_cf(blocks_cf, key)?;
+```
+
+### Iteration Pattern
+```rust
+// Use the built-in iterator for sequential access
+for block_result in chain.iter() {
+    let block = block_result?; // Handle Result properly
+    // Block data is already decrypted here
+    println!("Height: {}, Data: {:?}", block.block_header.height, block.block_data);
+}
+```
 - **Iterator limitations**: No reverse iteration, filtering, or seeking to specific heights
 - **SledDB removed**: Migration to RocksDB complete, but no backward compatibility with Sled databases
 - **No benchmark suite**: Consider adding criterion benchmarks for encryption/decryption performance

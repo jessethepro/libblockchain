@@ -36,9 +36,10 @@
 
 use crate::block::{BLOCK_HASH_SIZE, BLOCK_HEIGHT_SIZE, Block};
 use crate::db_model::RocksDbModel;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
+use openssl::pkey::Private;
 use openssl::rsa::Padding;
 use openssl::symm::Cipher;
 use rocksdb::{DB, IteratorMode};
@@ -122,7 +123,7 @@ impl BlockChain {
     /// - The required trees cannot be opened
     /// - The height index cannot be read
     /// - The private key cannot be loaded
-    pub fn new<P: AsRef<Path>>(path: P, private_key_path: P) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(path: P, private_key: PKey<Private>) -> Result<Self> {
         let db = RocksDbModel::new(path.as_ref().to_path_buf())
             .with_column_family("blocks")
             .with_column_family("signatures")
@@ -131,49 +132,15 @@ impl BlockChain {
 
         let db = std::sync::Arc::new(db);
 
-        // Load private key from PEM file
-
-        let (private_key_der, public_key) =
-            (|| -> Result<(Vec<u8>, PKey<openssl::pkey::Public>)> {
-                let pem_path = private_key_path
-                    .as_ref()
-                    .to_str()
-                    .ok_or_else(|| anyhow!("Invalid private key path"))?;
-
-                let pem_data = std::fs::read(pem_path)
-                    .with_context(|| format!("Failed to read private key from {}", pem_path))?;
-
-                use std::io::Write;
-                print!("Enter password for private key (press Enter if none): ");
-                std::io::stdout().flush()?;
-                let pwd = rpassword::read_password()?;
-
-                let key = if !pwd.is_empty() {
-                    PKey::private_key_from_pem_passphrase(&pem_data, pwd.as_bytes())
-                        .context("Failed to decrypt private key with password")?
-                } else {
-                    PKey::private_key_from_pem(&pem_data)
-                        .context("Failed to parse private key PEM")?
-                };
-                let public_der_bytes = key
-                    .public_key_to_der()
-                    .context("Failed to extract public key to DER")?;
-                let private_der_bytes = key
-                    .private_key_to_der()
-                    .context("Failed to convert private key to DER")?;
-
-                let public_key = PKey::public_key_from_der(&public_der_bytes)
-                    .context("Failed to reconstruct public key from DER")?;
-
-                Ok((private_der_bytes, public_key))
-            })()?;
-
         Ok(Self {
             db,
             private_key: SecretBox::new(Box::new(SecurePrivateKey {
-                der_bytes: private_key_der,
+                der_bytes: private_key.private_key_to_der()?,
             })),
-            public_key,
+            public_key: private_key
+                .public_key_to_pem()
+                .and_then(|pem| PKey::public_key_from_pem(&pem))
+                .map_err(|e| anyhow!("Failed to extract public key: {}", e))?,
             mode: Mode::ReadWrite,
         })
     }
@@ -533,10 +500,6 @@ impl BlockChain {
             }
         }
         Ok(Some(block_count - 1))
-    }
-
-    pub fn get_private_key(&self) -> Vec<u8> {
-        self.private_key.expose_secret().der_bytes.clone()
     }
 
     /// Get the total number of blocks stored in the blockchain

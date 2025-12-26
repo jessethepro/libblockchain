@@ -29,22 +29,26 @@
 //! The application's private key is required to RSA-OAEP decrypt the AES key,
 //! which is then used to AES-GCM decrypt the actual block data.
 //!
+//! # Key Management
+//!
+//! Private keys are stored in the Linux kernel keyring for secure, isolated storage.
+//! The blockchain reads keys from the process keyring using `keyutils`. Keys must
+//! be added to the keyring before creating the blockchain instance.
+//!
 //! # Concurrency
 //!
-//! The database is Arc-wrapped and thread-safe. RocksDB handles concurrent
-//! reads efficiently, while writes are serialized internally.
+//! The database is thread-safe. RocksDB handles concurrent reads efficiently,
+//! while writes are serialized internally.
 
 use crate::block::{BLOCK_HASH_SIZE, BLOCK_HEIGHT_SIZE, Block};
 use crate::db_model::RocksDbModel;
 use anyhow::{Result, anyhow};
+use keyutils::Keyring;
 use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
-use openssl::pkey::Private;
 use openssl::rsa::Padding;
 use openssl::symm::Cipher;
 use rocksdb::{DB, IteratorMode};
-use secrecy::{ExposeSecret, SecretBox, zeroize::Zeroize};
-use std::fmt;
 use std::path::Path;
 
 pub const AES_KEY_LEN_SIZE: usize = 4; // u32 for AES key length
@@ -59,165 +63,73 @@ pub const DATA_LEN_SIZE: usize = 4; // u32 for block length
 /// key-value store. Blocks are stored directly by height (u64) as the key,
 /// enabling efficient sequential access via RocksDB's native iterator.
 ///
+/// # Key Storage
+///
+/// Private keys are stored in the Linux kernel keyring (accessed via `keyutils`).
+/// The blockchain reads keys from the process keyring by name. Keys remain
+/// isolated in kernel memory and are never written to disk.
+///
 /// # Thread Safety
 ///
-/// The `BlockChain` is thread-safe with an Arc-wrapped RocksDB instance.
-/// Multiple readers can access blocks concurrently, while RocksDB serializes
-/// write operations internally.
-///
-/// A securely stored private key that implements Zeroize
-#[derive(Clone)]
-struct SecurePrivateKey {
-    der_bytes: Vec<u8>,
-}
-
-impl Zeroize for SecurePrivateKey {
-    fn zeroize(&mut self) {
-        self.der_bytes.zeroize();
-    }
-}
-
-impl fmt::Debug for SecurePrivateKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SecurePrivateKey")
-            .field("der_bytes", &"<redacted>")
-            .finish()
-    }
-}
-#[derive(PartialEq, Eq)]
-pub(crate) enum Mode {
-    ReadOnly,
-    ReadWrite,
-}
+/// The `BlockChain` is thread-safe. Multiple readers can access blocks
+/// concurrently, while RocksDB serializes write operations internally.
 pub struct BlockChain {
     /// RocksDB database instance
-    db: std::sync::Arc<DB>,
+    db: DB,
 
-    /// Secured Private key for decrypting block data
-    private_key: SecretBox<SecurePrivateKey>,
+    /// Secured Keyutils key storage for the application's private key
+    pub proc_keyring: Keyring,
 
     /// Public key for encrypting block data
     pub public_key: PKey<openssl::pkey::Public>,
-
-    #[allow(dead_code)]
-    mode: Mode,
 }
 
 impl BlockChain {
     /// Open or create a new blockchain database
     ///
     /// Opens an existing blockchain at the specified path, or creates a new one
-    /// if it doesn't exist. Automatically recovers the current height from the
-    /// database by scanning the height index.
+    /// if it doesn't exist.
     ///
     /// # Arguments
     /// * `path` - Path to the database directory
-    /// * `private_key_path` - Path to the PEM file containing the application's private key
+    /// * `proc_keyring` - Linux kernel keyring containing the application's private key
     ///
     /// # Returns
-    /// A `BlockChain` instance with recovered state
+    /// A `BlockChain` instance ready for use
     ///
     /// # Errors
     /// Returns an error if:
     /// - The database cannot be opened or created
-    /// - The required trees cannot be opened
-    /// - The height index cannot be read
-    /// - The private key cannot be loaded
-    pub fn new<P: AsRef<Path>>(path: P, private_key: PKey<Private>) -> Result<Self> {
+    /// - The private key cannot be found in the keyring
+    /// - The private key data cannot be read or parsed
+    ///
+    /// # Key Requirements
+    ///
+    /// The keyring must contain a key named "app-key" with DER-encoded private key data.
+    /// Use `keyctl` to add keys to the process keyring:
+    /// ```bash
+    /// keyctl padd user app-key @p < private_key.der
+    /// ```
+    pub fn new<P: AsRef<Path>>(path: P, proc_keyring: Keyring) -> Result<Self> {
         let db = RocksDbModel::new(path.as_ref().to_path_buf())
             .with_column_family("blocks")
             .with_column_family("signatures")
             .open()
             .map_err(|e| anyhow!("Failed to open RocksDB: {}", e))?;
-
-        let db = std::sync::Arc::new(db);
+        // Load public key from the keyring
+        let key = proc_keyring
+            .search_for_key::<keyutils::keytypes::user::User, _, _>("app-key", None)
+            .map_err(|e| anyhow!("Failed to find private key in keyring: {}", e))?;
+        let private_key_der = key
+            .read()
+            .map_err(|e| anyhow!("Failed to read private key data: {}", e))?;
+        let public_key = PKey::public_key_from_der(private_key_der.as_slice())
+            .map_err(|e| anyhow!("Failed to parse public key PEM: {}", e))?;
 
         Ok(Self {
             db,
-            private_key: SecretBox::new(Box::new(SecurePrivateKey {
-                der_bytes: private_key.private_key_to_der()?,
-            })),
-            public_key: private_key
-                .public_key_to_pem()
-                .and_then(|pem| PKey::public_key_from_pem(&pem))
-                .map_err(|e| anyhow!("Failed to extract public key: {}", e))?,
-            mode: Mode::ReadWrite,
-        })
-    }
-
-    /// Convert this blockchain into read-only mode
-    ///
-    /// Consumes the current instance, closes the database, and reopens it
-    /// in read-only mode. The private and public keys are preserved without
-    /// re-prompting for passwords.
-    ///
-    /// # Arguments
-    /// * `path` - Path to the database directory
-    ///
-    /// # Returns
-    /// A new `BlockChain` instance opened in read-only mode
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be reopened in read-only mode
-    pub fn into_read_only(self) -> Result<Self> {
-        // Extract keys before dropping db
-        let private_key = self.private_key;
-        let public_key = self.public_key;
-        let path = self.db.path().to_path_buf();
-
-        // Drop the database to close it
-        drop(self.db);
-
-        // Reopen in read-only mode
-        let db = RocksDbModel::read_only(path)
-            .with_column_family("blocks")
-            .with_column_family("signatures")
-            .open()
-            .map_err(|e| anyhow!("Failed to open RocksDB in read-only mode: {}", e))?;
-
-        Ok(Self {
-            db: std::sync::Arc::new(db),
-            private_key,
+            proc_keyring,
             public_key,
-            mode: Mode::ReadOnly,
-        })
-    }
-
-    /// Convert this blockchain into read-write mode
-    ///
-    /// Consumes the current instance, closes the database, and reopens it
-    /// in read-write mode. The private and public keys are preserved without
-    /// re-prompting for passwords.
-    ///
-    /// # Arguments
-    /// * `path` - Path to the database directory
-    ///
-    /// # Returns
-    /// A new `BlockChain` instance opened in read-write mode
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be reopened in read-write mode
-    pub fn into_read_write(self) -> Result<Self> {
-        // Extract keys before dropping db
-        let private_key = self.private_key;
-        let public_key = self.public_key;
-        let path = self.db.path().to_path_buf();
-
-        // Drop the database to close it
-        drop(self.db);
-
-        // Reopen in read-write mode
-        let db = RocksDbModel::new(path)
-            .with_column_family("blocks")
-            .with_column_family("signatures")
-            .open()
-            .map_err(|e| anyhow!("Failed to open RocksDB in read-write mode: {}", e))?;
-
-        Ok(Self {
-            db: std::sync::Arc::new(db),
-            private_key,
-            public_key,
-            mode: Mode::ReadWrite,
         })
     }
 
@@ -422,10 +334,17 @@ impl BlockChain {
         let decrypted_data = {
             // Decrypt AES key with RSA-OAEP
             let aes_key = (|| -> Result<Vec<u8>> {
-                let rsa = self.private_key.expose_secret().der_bytes.as_slice();
-                let pkey = PKey::private_key_from_der(rsa)
-                    .map_err(|e| anyhow!("Failed to reconstruct private key: {}", e))?;
-                let rsa = pkey
+                let app_key = self
+                    .proc_keyring
+                    .search_for_key::<keyutils::keytypes::user::User, _, _>("app-key", None)
+                    .map_err(|e| anyhow!("Failed to find private key in keyring: {}", e))?;
+                let app_key_der = app_key
+                    .read()
+                    .map_err(|e| anyhow!("Failed to read private key data: {}", e))?;
+
+                let private_key = PKey::private_key_from_der(app_key_der.as_slice())
+                    .map_err(|e| anyhow!("Failed to parse private key DER: {}", e))?;
+                let rsa = private_key
                     .rsa()
                     .map_err(|e| anyhow!("Failed to get RSA key: {}", e))?;
                 let mut plaintext = vec![0u8; rsa.size() as usize];

@@ -8,7 +8,7 @@
 //! - Persistent storage using RocksDB
 //! - Integrated hybrid RSA-OAEP + AES-256-GCM encryption
 //! - Automatic height and parent relationship management
-//! - Interactive password prompting for encrypted private keys
+//! - Secure key storage in Linux kernel keyring via `keyutils`
 //!
 //! # Build Dependencies
 //!
@@ -39,16 +39,14 @@
 //!
 //! ```no_run
 //! use libblockchain::blockchain::BlockChain;
-//! use openssl::pkey::PKey;
-//! use std::fs;
+//! use keyutils::{Keyring, SpecialKeyring};
 //!
 //! # fn example() -> anyhow::Result<()> {
-//! // Load private key from PEM file
-//! let key_pem = fs::read("./app_private_key.pem")?;
-//! let private_key = PKey::private_key_from_pem(&key_pem)?;
+//! // Attach to the process keyring (keys must be pre-loaded)
+//! let keyring = Keyring::attach(SpecialKeyring::Process)?;
 //!
-//! // Create blockchain with loaded private key
-//! let chain = BlockChain::new("./my_blockchain", private_key)?;
+//! // Create blockchain using keys from the keyring
+//! let chain = BlockChain::new("./my_blockchain", keyring)?
 //!
 //! // Insert blocks (automatically encrypted with AES-256-GCM + RSA-OAEP)
 //! chain.put_block(b"My genesis data".to_vec())?;
@@ -78,8 +76,9 @@
 //!
 //! - **Hybrid Encryption**: AES-256-GCM for data encryption, RSA-OAEP for key encapsulation
 //! - **Authenticated Encryption**: AES-GCM provides both confidentiality and integrity
-//! - **Secure Key Storage**: Private keys protected using `secrecy` crate with automatic zeroing
-//! - **Interactive Security**: Password prompting for encrypted private keys via `rpassword`
+//! - **Kernel Keyring Storage**: Private keys stored in Linux kernel keyring, isolated from userspace
+//! - **No Disk Storage**: Keys never written to disk, remain in kernel memory
+//! - **Process Isolation**: Keys accessible only within the process keyring scope
 //! - **Random Nonces**: Unique encryption per block ensures semantic security
 //!
 //! # Design Decisions

@@ -78,10 +78,13 @@ pub struct BlockChain {
     db: DB,
 
     /// Secured Keyutils key storage for the application's private key
-    pub proc_keyring: Keyring,
+    proc_keyring: Keyring,
+
+    /// Name of the application's private key in the keyring
+    app_key_name: String,
 
     /// Public key for encrypting block data
-    pub public_key: PKey<openssl::pkey::Public>,
+    public_key: PKey<openssl::pkey::Public>,
 }
 
 impl BlockChain {
@@ -93,6 +96,7 @@ impl BlockChain {
     /// # Arguments
     /// * `path` - Path to the database directory
     /// * `proc_keyring` - Linux kernel keyring containing the application's private key
+    /// * `app_key_name` - Name of the key in the keyring (e.g., "my-app-key")
     ///
     /// # Returns
     /// A `BlockChain` instance ready for use
@@ -105,12 +109,27 @@ impl BlockChain {
     ///
     /// # Key Requirements
     ///
-    /// The keyring must contain a key named "app-key" with DER-encoded private key data.
+    /// The keyring must contain a key with DER-encoded private key data.
     /// Use `keyctl` to add keys to the process keyring:
     /// ```bash
-    /// keyctl padd user app-key @p < private_key.der
+    /// keyctl padd user my-app-key @p < private_key.der
     /// ```
-    pub fn new<P: AsRef<Path>>(path: P, proc_keyring: Keyring) -> Result<Self> {
+    ///
+    /// # Example
+    /// ```no_run
+    /// use libblockchain::blockchain::BlockChain;
+    /// use keyutils::{Keyring, SpecialKeyring};
+    /// # fn example() -> anyhow::Result<()> {
+    /// let keyring = Keyring::attach(SpecialKeyring::Process)?;
+    /// let chain = BlockChain::new("./my_blockchain", keyring, "my-app-key".to_string())?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new<P: AsRef<Path>>(
+        path: P,
+        proc_keyring: Keyring,
+        app_key_name: String,
+    ) -> Result<Self> {
         let db = RocksDbModel::new(path.as_ref().to_path_buf())
             .with_column_family("blocks")
             .with_column_family("signatures")
@@ -118,7 +137,7 @@ impl BlockChain {
             .map_err(|e| anyhow!("Failed to open RocksDB: {}", e))?;
         // Load public key from the keyring
         let key = proc_keyring
-            .search_for_key::<keyutils::keytypes::user::User, _, _>("app-key", None)
+            .search_for_key::<keyutils::keytypes::user::User, _, _>(app_key_name.clone(), None)
             .map_err(|e| anyhow!("Failed to find private key in keyring: {}", e))?;
         let private_key_der = key
             .read()
@@ -129,6 +148,7 @@ impl BlockChain {
         Ok(Self {
             db,
             proc_keyring,
+            app_key_name: app_key_name,
             public_key,
         })
     }
@@ -184,10 +204,13 @@ impl BlockChain {
 
             // Encrypt AES key with RSA-OAEP
             let encrypted_aes_key = (|| -> Result<Vec<u8>> {
-                let rsa = self
-                    .public_key
-                    .rsa()
-                    .map_err(|e| anyhow!("Failed to get RSA key: {}", e))?;
+                let rsa = (|| -> Result<openssl::rsa::Rsa<openssl::pkey::Public>> {
+                    let rsa = self
+                        .public_key
+                        .rsa()
+                        .map_err(|e| anyhow!("Failed to get RSA key: {}", e))?;
+                    Ok(rsa)
+                })()?;
                 let mut ciphertext = vec![0u8; rsa.size() as usize];
                 let len = rsa
                     .public_encrypt(&aes_key, &mut ciphertext, Padding::PKCS1_OAEP)
@@ -336,15 +359,18 @@ impl BlockChain {
             let aes_key = (|| -> Result<Vec<u8>> {
                 let app_key = self
                     .proc_keyring
-                    .search_for_key::<keyutils::keytypes::user::User, _, _>("app-key", None)
+                    .search_for_key::<keyutils::keytypes::user::User, _, _>(
+                        self.app_key_name.clone(),
+                        None,
+                    )
                     .map_err(|e| anyhow!("Failed to find private key in keyring: {}", e))?;
                 let app_key_der = app_key
                     .read()
                     .map_err(|e| anyhow!("Failed to read private key data: {}", e))?;
 
-                let private_key = PKey::private_key_from_der(app_key_der.as_slice())
+                let app_private_key = PKey::private_key_from_der(app_key_der.as_slice())
                     .map_err(|e| anyhow!("Failed to parse private key DER: {}", e))?;
-                let rsa = private_key
+                let rsa = app_private_key
                     .rsa()
                     .map_err(|e| anyhow!("Failed to get RSA key: {}", e))?;
                 let mut plaintext = vec![0u8; rsa.size() as usize];

@@ -8,7 +8,7 @@ A generic, lightweight Rust library for creating and managing blockchain blocks 
 - **Persistent storage**: Built-in RocksDB integration for blockchain persistence
 - **Automatic height management**: Heights assigned automatically for sequential block ordering
 - **Hybrid encryption**: RSA-OAEP + AES-256-GCM encryption for block data
-- **Kernel keyring storage**: Private keys stored in Linux kernel keyring, isolated and secure
+- **Kernel keyring storage**: Private keys stored in Linux kernel keyring, isolated and secure, with configurable key names
 - **Height-based indexing**: Efficient block lookup by height
 - **Native RocksDB iterator**: Efficient traversal using RocksDB's built-in iteration
 - **Configurable database**: Multiple RocksDB presets (high performance, high durability, read-only)
@@ -45,11 +45,11 @@ use libblockchain::blockchain::BlockChain;
 use keyutils::{Keyring, SpecialKeyring};
 
 // Attach to the process keyring (keys must be pre-loaded using keyctl)
-// Example: keyctl padd user app-key @p < private_key.der
+// Example: keyctl padd user my-app-key @p < private_key.der
 let keyring = Keyring::attach(SpecialKeyring::Process)?;
 
-// Create or open a blockchain using the keyring
-let chain = BlockChain::new("./my_blockchain", keyring)?;
+// Create or open a blockchain using the keyring with a custom key name
+let chain = BlockChain::new("./my_blockchain", keyring, "my-app-key".to_string())?;
 
 // Insert blocks (automatically encrypted with AES-256-GCM + RSA-OAEP)
 chain.put_block(b"Genesis data".to_vec())?;
@@ -124,12 +124,12 @@ let private_key = PKey::from_rsa(rsa)?;
 // Export as DER for keyring storage
 let der = private_key.private_key_to_der()?;
 
-// Add key to the Linux kernel keyring
+// Add key to the Linux kernel keyring with a custom name
 let mut keyring = Keyring::attach_or_create(SpecialKeyring::Process)?;
-keyring.add_key::<keyutils::keytypes::user::User, _, _>("app-key", &der)?;
+keyring.add_key::<keyutils::keytypes::user::User, _, _>("my-app-key", &der)?;
 
 // Or from command line:
-// openssl genrsa 4096 | openssl rsa -outform DER | keyctl padd user app-key @p
+// openssl genrsa 4096 | openssl rsa -outform DER | keyctl padd user my-app-key @p
 ```
 
 ### Creating and Using a Blockchain
@@ -141,8 +141,8 @@ use keyutils::{Keyring, SpecialKeyring};
 // Attach to the keyring
 let keyring = Keyring::attach(SpecialKeyring::Process)?;
 
-// Create blockchain
-let chain = BlockChain::new("./my_blockchain", keyring)?;
+// Create blockchain with the key name you used when adding the key
+let chain = BlockChain::new("./my_blockchain", keyring, "my-app-key".to_string())?;
 
 // Insert blocks (automatic height assignment and encryption)
 chain.put_block(b"Genesis data".to_vec())?;
@@ -249,7 +249,7 @@ let db = RocksDbModel::new("./custom_blockchain")
 ### `BlockChain`
 
 **Creation:**
-- `new<P: AsRef<Path>>(path: P, proc_keyring: Keyring) -> Result<Self>`: Open or create blockchain using Linux kernel keyring for key storage
+- `new<P: AsRef<Path>>(path: P, proc_keyring: Keyring, app_key_name: String) -> Result<Self>`: Open or create blockchain using Linux kernel keyring for key storage with a custom key name
 
 **Insertion:**
 - `put_block(&self, block_data: Vec<u8>) -> Result<()>`: Insert new block (automatically encrypted with AES-256-GCM + RSA-OAEP)

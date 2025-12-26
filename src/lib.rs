@@ -46,7 +46,7 @@
 //! let keyring = Keyring::attach(SpecialKeyring::Process)?;
 //!
 //! // Create blockchain using keys from the keyring
-//! let chain = BlockChain::new("./my_blockchain", keyring)?
+//! let chain = BlockChain::new("./my_blockchain", keyring, "my-app-key".to_string())?;
 //!
 //! // Insert blocks (automatically encrypted with AES-256-GCM + RSA-OAEP)
 //! chain.put_block(b"My genesis data".to_vec())?;

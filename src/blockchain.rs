@@ -43,12 +43,12 @@
 use crate::block::{BLOCK_HASH_SIZE, BLOCK_HEIGHT_SIZE, Block};
 use crate::db_model::RocksDbModel;
 use anyhow::{Result, anyhow};
-use keyutils::Keyring;
 use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
 use openssl::rsa::Padding;
 use openssl::symm::Cipher;
 use rocksdb::{DB, IteratorMode};
+use secrecy::{ExposeSecret, SecretBox};
 use std::path::Path;
 
 pub const AES_KEY_LEN_SIZE: usize = 4; // u32 for AES key length
@@ -77,13 +77,10 @@ pub struct BlockChain {
     /// RocksDB database instance
     db: DB,
 
-    /// Secured Keyutils key storage for the application's private key
-    proc_keyring: Keyring,
+    /// The App Private key for decrypting block data is stored in a SecretBox for security
+    app_key: SecretBox<Vec<u8>>,
 
-    /// Name of the application's private key in the keyring
-    app_key_name: String,
-
-    /// Public key for encrypting block data
+    /// The App Public key for encrypting block data
     public_key: PKey<openssl::pkey::Public>,
 }
 
@@ -125,30 +122,25 @@ impl BlockChain {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new<P: AsRef<Path>>(
-        path: P,
-        proc_keyring: Keyring,
-        app_key_name: String,
-    ) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(path: P, app_key: PKey<openssl::pkey::Private>) -> Result<Self> {
         let db = RocksDbModel::new(path.as_ref().to_path_buf())
             .with_column_family("blocks")
             .with_column_family("signatures")
             .open()
             .map_err(|e| anyhow!("Failed to open RocksDB: {}", e))?;
         // Load public key from the keyring
-        let key = proc_keyring
-            .search_for_key::<keyutils::keytypes::user::User, _, _>(app_key_name.clone(), None)
-            .map_err(|e| anyhow!("Failed to find private key in keyring: {}", e))?;
-        let private_key_der = key
-            .read()
-            .map_err(|e| anyhow!("Failed to read private key data: {}", e))?;
-        let public_key = PKey::public_key_from_der(private_key_der.as_slice())
-            .map_err(|e| anyhow!("Failed to parse public key PEM: {}", e))?;
+        let public_key = app_key
+            .public_key_to_der()
+            .and_then(|der| PKey::public_key_from_der(&der))
+            .map_err(|e| anyhow!("Failed to extract public key DER: {}", e))?;
 
         Ok(Self {
             db,
-            proc_keyring,
-            app_key_name: app_key_name,
+            app_key: SecretBox::new(Box::new(
+                app_key
+                    .private_key_to_der()
+                    .map_err(|e| anyhow!("Failed to serialize private key to DER format: {}", e))?,
+            )),
             public_key,
         })
     }
@@ -357,19 +349,9 @@ impl BlockChain {
         let decrypted_data = {
             // Decrypt AES key with RSA-OAEP
             let aes_key = (|| -> Result<Vec<u8>> {
-                let app_key = self
-                    .proc_keyring
-                    .search_for_key::<keyutils::keytypes::user::User, _, _>(
-                        self.app_key_name.clone(),
-                        None,
-                    )
-                    .map_err(|e| anyhow!("Failed to find private key in keyring: {}", e))?;
-                let app_key_der = app_key
-                    .read()
-                    .map_err(|e| anyhow!("Failed to read private key data: {}", e))?;
-
-                let app_private_key = PKey::private_key_from_der(app_key_der.as_slice())
-                    .map_err(|e| anyhow!("Failed to parse private key DER: {}", e))?;
+                let app_private_key =
+                    PKey::private_key_from_der(self.app_key.expose_secret().as_slice())
+                        .map_err(|e| anyhow!("Failed to parse private key DER: {}", e))?;
                 let rsa = app_private_key
                     .rsa()
                     .map_err(|e| anyhow!("Failed to get RSA key: {}", e))?;

@@ -231,6 +231,7 @@ dependencies = [
  "serde",
  "tempfile",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

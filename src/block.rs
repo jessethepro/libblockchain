@@ -60,8 +60,8 @@ impl BlockHeader {
     /// * `height` - Block height in chain (0 for genesis, increments for each block)
     ///
     /// # Returns
-    /// Tuple of (BlockHeader, block_hash)
-    pub fn new(parent_hash: [u8; BLOCK_HASH_SIZE], height: u64) -> (Self, [u8; BLOCK_HASH_SIZE]) {
+    /// New `BlockHeader` instance
+    pub fn new(parent_hash: [u8; BLOCK_HASH_SIZE], height: u64) -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
         use uuid::Uuid;
 
@@ -71,26 +71,13 @@ impl BlockHeader {
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_secs();
-        let header = Self {
+        Self {
             height,
             block_uid,
             version,
             parent_hash,
             timestamp,
-        };
-        let block_hash = {
-            let hash_vec = openssl::hash::hash(MessageDigest::sha512(), &header.bytes())
-                .expect("SHA-512 hashing failed")
-                .to_vec();
-            let mut hash = [0u8; BLOCK_HASH_SIZE];
-            hash.copy_from_slice(
-                hash_vec
-                    .get(..BLOCK_HASH_SIZE)
-                    .expect("SHA-512 hash should be 64 bytes"),
-            );
-            hash
-        };
-        (header, block_hash)
+        }
     }
 
     /// Deserialize a BlockHeader from bytes
@@ -167,18 +154,6 @@ impl BlockHeader {
         bytes.extend_from_slice(&self.timestamp.to_le_bytes());
         bytes
     }
-
-    /// Generate SHA-512 hash of this header
-    ///
-    /// This is the block's cryptographic identity used for linking child blocks.
-    pub fn generate_block_hash(&self) -> [u8; 64] {
-        let hash_vec = openssl::hash::hash(MessageDigest::sha512(), &self.bytes())
-            .expect("SHA-512 hashing failed")
-            .to_vec();
-        let mut hash = [0u8; 64];
-        hash.copy_from_slice(hash_vec.get(..64).expect("SHA-512 hash should be 64 bytes"));
-        hash
-    }
 }
 
 /// Complete block with header, hash, and application data
@@ -221,7 +196,14 @@ impl Block {
     /// * `parent_hash` - SHA-512 hash of the parent block
     /// * `block_data` - Application-specific data (will be encrypted when stored)
     pub fn new_regular_block(height: u64, parent_hash: [u8; 64], block_data: Vec<u8>) -> Self {
-        let (block_header, block_hash) = BlockHeader::new(parent_hash, height);
+        let block_header = BlockHeader::new(parent_hash, height);
+        let mut hashing_data = Vec::from(block_header.bytes());
+        hashing_data.extend_from_slice(&block_data);
+        let block_hash = openssl::hash::hash(MessageDigest::sha512(), &hashing_data)
+            .expect("Failed to compute block hash")
+            .as_ref()
+            .try_into()
+            .expect("Hash length mismatch");
         Self {
             block_header,
             block_hash,
@@ -237,12 +219,7 @@ impl Block {
     /// * `block_data` - Application-specific data (will be encrypted when stored)
     pub fn new_genesis_block(block_data: Vec<u8>) -> Self {
         // Genesis block has height 0 and parent hash of all zeros.
-        let (block_header, block_hash) = BlockHeader::new([0u8; 64], 0);
-        Self {
-            block_header,
-            block_hash,
-            block_data,
-        }
+        Self::new_regular_block(0, [0u8; 64], block_data)
     }
 
     /// Deserialize a Block from bytes

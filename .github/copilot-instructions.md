@@ -3,10 +3,12 @@
 ## Project Overview
 A **generic, data-agnostic blockchain library** with persistent storage, hybrid encryption, and secure key management. The library provides infrastructure for blockchain operations while remaining agnostic to payload content. Applications define what data goes in `block_data: Vec<u8>`.
 
-**Tech Stack**: Rust (edition 2024), RocksDB (persistent storage), OpenSSL (cryptography), Linux kernel keyring via `keyutils` crate  
-**Recent Activity**: Migrated from PEM file-based keys to Linux kernel keyring (December 2025), successfully migrated from SledDB to RocksDB (December 2025)
+**Tech Stack**: Rust (edition 2024), RocksDB (persistent storage), OpenSSL (cryptography), `secrecy` crate for key protection  
+**Recent Activity**: Migrated from SledDB to RocksDB (December 2025), migrated from X509 certificates to direct PKey usage (December 2025), currently refactoring encryption API (January 2026)
 
-**⚠️ Critical API Change**: `BlockChain::new()` now takes `keyutils::Keyring`, NOT `PKey<Private>` or file paths. Keys must be loaded into the Linux kernel keyring before blockchain initialization.
+**⚠️ CODE STATUS**: The `src/blockchain.rs` file currently has syntax errors and incomplete implementation. The struct `BlockChain` references `self.app_key` in `decrypt_block_data()` but this field is missing from the struct definition. The last stable API was `BlockChain::new(path, app_key: PKey<Private>)`.
+
+**⚠️ Before making changes**: Run `cargo check` to see current compilation errors. The main issues are in [src/blockchain.rs](src/blockchain.rs) around line 183 (app_key reference) and line 258 (delete_latest_block match syntax).
 
 ## Architecture
 
@@ -19,10 +21,9 @@ A **generic, data-agnostic blockchain library** with persistent storage, hybrid 
 
 - **[src/blockchain.rs](src/blockchain.rs)**: RocksDB-backed persistent storage with integrated encryption
   - Two RocksDB column families: `blocks` (height u64 → encrypted block), `signatures` (height u64 → signature)
-  - Database wrapped in `Arc<DB>` for thread-safe sharing
+  - Database wrapped in `Arc<DB>` for thread-safe sharing (planned - currently single-threaded)
   - **Hybrid encryption**: AES-256-GCM for block data, RSA-OAEP for key encapsulation
-  - **Kernel keyring integration**: Reads private keys from Linux kernel keyring using `keyutils` crate
-  - Searches for key named `"root-key"` in the process keyring (hardcoded in `BlockChain::new()`)
+  - **Key protection**: Private keys stored in `SecretBox<Vec<u8>>` from `secrecy` crate, automatically zeroed on drop
   - Public key automatically extracted from private key DER data on initialization
   - Storage format: `[key_len(4)] || [RSA(AES_key)(var)] || [nonce(12)] || [tag(16)] || [data_len(4)] || [AES(Block)(var)]`
 
@@ -39,9 +40,9 @@ A **generic, data-agnostic blockchain library** with persistent storage, hybrid 
 - **Automatic height management**: Heights assigned on `put_block()` by counting existing blocks
 - **Transparent encryption**: Encrypt on write, decrypt on read - users see plaintext `block_data`
 - **Security by default**: All block data encrypted with unique AES-256-GCM keys per block
-- **Kernel keyring storage**: Private keys stored in Linux kernel keyring, isolated from userspace, never written to disk
+- **Key protection**: Keys wrapped in `secrecy::SecretBox` for automatic zeroing on drop
 - **Column families**: RocksDB's equivalent of "tables" - accessed via `cf_handle()`
-- **External dependencies**: `rocksdb` with `mt_static` feature for multi-threaded static linking, OpenSSL for crypto, `keyutils` for kernel keyring
+- **External dependencies**: `rocksdb` with `mt_static` feature for multi-threaded static linking, OpenSSL for crypto
 
 ## Data Types & Constants
 
@@ -62,8 +63,8 @@ const AES_GCM_TAG_SIZE: usize = 16;      // 128-bit auth tag
 
 ### BlockChain Operations
 ```rust
-// Initialization (USES KERNEL KEYRING)
-BlockChain::new(path, keyring: Keyring)  // Opens/creates blockchain, reads "root-key" from keyring
+// Initialization
+BlockChain::new(path, app_key: PKey<Private>)  // Opens/creates blockchain with OpenSSL private key
 
 // Insertion & deletion
 .put_block(data: Vec<u8>)                // Insert block with automatic height assignment
@@ -76,10 +77,6 @@ BlockChain::new(path, keyring: Keyring)  // Opens/creates blockchain, reads "roo
 .get_max_height()                        // Get height of last block (or 0 for empty)
 .block_count()                           // Total blocks in chain
 
-// Mode switching
-.into_read_only()                        // Convert to read-only (preserves keyring reference)
-.into_read_write()                       // Convert back to read-write mode
-
 // Validation & iteration
 .validate()                              // Verify entire chain integrity (parent hashes)
 .iter()                                  // Returns BlockIterator for sequential traversal
@@ -89,69 +86,52 @@ BlockChain::new(path, keyring: Keyring)  // Opens/creates blockchain, reads "roo
 
 ### Build & Test
 ```bash
+cargo check                    # Fast type checking - USE FIRST to see current errors
 cargo build                    # First build takes 5-10 min (compiles RocksDB + OpenSSL)
 cargo test                     # Run unit tests (currently none exist)
 cargo doc --open               # View documentation
-cargo check                    # Fast type checking
 cargo clippy                   # Lint checking (project uses clippy::unwrap_used & indexing_slicing warnings)
 ```
 
-**Build Requirements**: Linux kernel 3.10+ (for keyring), C++ compiler (g++/clang), CMake, make. RocksDB and OpenSSL compile from source via `vendored` and `mt_static` features.
+**⚠️ Current Build Status**: The project has active syntax/compilation errors in [src/blockchain.rs](src/blockchain.rs). Run `cargo check` to see:
+- Missing `app_key` field in `BlockChain` struct (referenced at line 183)
+- Syntax errors in `delete_latest_block()` match statement (line 258)
+- Unclosed delimiter causing cascading errors
+
+**Build Requirements**: Linux (for compilation), C++ compiler (g++/clang), CMake, make. RocksDB and OpenSSL compile from source via `vendored` and `mt_static` features.
 
 **Clippy Configuration**: Project enforces `#![warn(clippy::unwrap_used)]` and `#![warn(clippy::indexing_slicing)]` - use proper error handling and bounds checking.
 
-### Working with Linux Kernel Keyring
-The library requires keys to be pre-loaded into the Linux kernel keyring. **The blockchain searches for a key named `"root-key"`** (hardcoded in `src/blockchain.rs` line 121).
-
-#### Generate and Load Keys
-```bash
-# Generate RSA private key (4096-bit recommended)
-openssl genrsa 4096 > private_key.pem
-
-# Convert to DER format (required for keyring)
-openssl rsa -in private_key.pem -outform DER -out private_key.der
-
-# Load into process keyring (@p) with name "root-key"
-keyctl padd user root-key @p < private_key.der
-
-# Verify key is loaded
-keyctl show @p
-
-# List all keys in process keyring
-keyctl list @p
-```
-
-#### Load Keys from Rust
+### Generating and Using Keys
 ```rust
-use keyutils::{Keyring, SpecialKeyring};
-use keyutils::keytypes::user::User;
-use openssl::pkey::PKey;
 use openssl::rsa::Rsa;
+use openssl::pkey::PKey;
+use libblockchain::blockchain::BlockChain;
 
-// Generate key in Rust
+// Generate RSA key pair
 let rsa = Rsa::generate(4096)?;
 let private_key = PKey::from_rsa(rsa)?;
-let der = private_key.private_key_to_der()?;
 
-// Add to process keyring with name "root-key"
-let mut keyring = Keyring::attach_or_create(SpecialKeyring::Process)?;
-keyring.add_key::<User, _, _>("root-key", &der)?;
+// Create blockchain with the key
+let chain = BlockChain::new("./my_blockchain", private_key)?;
 
-// Then create blockchain
-let chain = BlockChain::new("./my_blockchain", keyring)?;
+// Insert encrypted blocks
+chain.put_block(b"Genesis data".to_vec())?;
 ```
 
-#### Read Key from Keyring (for debugging)
-```rust
-use keyutils::{Keyring, SpecialKeyring};
-use keyutils::keytypes::user::User;
+### Key Storage Patterns
+```bash
+# Generate key file (PEM format)
+openssl genrsa -out private_key.pem 4096
 
-let keyring = Keyring::attach(SpecialKeyring::Process)?;
-let key = keyring.search_for_key::<User, _, _>("root-key", None)?;
-let key_data: Vec<u8> = key.read()?;  // DER-encoded private key
+# Load from PEM file in Rust
+use openssl::pkey::PKey;
+use std::fs;
+
+let pem_data = fs::read("private_key.pem")?;
+let private_key = PKey::private_key_from_pem(&pem_data)?;
+let chain = BlockChain::new("./my_blockchain", private_key)?;
 ```
-
-**Important**: The key name `"root-key"` is hardcoded in `BlockChain::new()`. To use a different name, modify line 121 in [src/blockchain.rs](src/blockchain.rs).
 
 ### Database Inspection
 ```rust
@@ -203,25 +183,24 @@ let signatures_cf = db.cf_handle("signatures").unwrap();
 - All operations require `cf_handle()` lookup for the target column family
 - Use `Arc<DB>` wrapper for thread-safe database sharing
 
-**Keyring Changes:**
-- Key name `"root-key"` is hardcoded in [src/blockchain.rs](src/blockchain.rs) line 121 and 348
-- Uses `SpecialKeyring::Process` for process-local key isolation
-- Keys must be `user` type (via `keyutils::keytypes::user::User`)
-- DER format required (not PEM) - use `PKey::private_key_to_der()` or `openssl rsa -outform DER`
+**Key Management Changes:**
+- Keys passed directly to `BlockChain::new()` as `PKey<Private>`
+- Private keys wrapped in `SecretBox` internally for automatic zeroing
+- Public key extracted automatically from private key on initialization
+- Supports both PEM and DER format keys via OpenSSL's `PKey` API
 
 ## Security Considerations
-- **Kernel-level isolation**: Private keys stored in Linux kernel keyring, isolated from userspace memory dumps
-- **No disk persistence**: Keys remain in kernel memory, never written to disk
-- **Process isolation**: Keys in process keyring (@p) are accessible only within the process
+- **Memory protection**: Private keys stored in `SecretBox<Vec<u8>>` from `secrecy` crate, automatically zeroed on drop
 - **Key encapsulation**: Each block gets unique AES key, RSA-OAEP encrypts the AES key
 - **Authenticated encryption**: AES-GCM provides both confidentiality and integrity (AEAD)
-- **Memory zeroing**: Key data is Vec<u8> from keyring - no automatic zeroing on drop (kernel manages this)
+- **Random nonces**: 96-bit nonces generated per block for semantic security
+- **No key persistence**: Keys only in memory, never serialized to database
+- **Application responsibility**: Secure key storage/loading is application's responsibility
 
 ## Common Pitfalls
-- **Hardcoded key name**: `BlockChain::new()` searches for `"root-key"` - if you use a different name, blockchain initialization will fail
-- **DER format required**: Keyring expects DER-encoded keys, not PEM. Convert with `openssl rsa -outform DER`
-- **Process keyring scope**: Keys added to process keyring (@p) only exist within that process and its children
-- **Key must exist before `new()`**: Unlike old PEM approach, you can't pass the key directly - must pre-load into keyring
+- **Key lifetime**: Pass key by value to `new()` - it will be moved and stored internally
+- **Key format**: OpenSSL's `PKey` accepts both PEM and DER - use appropriate `from_pem()` or `from_der()` method
+- **SecretBox protection**: Private key wrapped in `SecretBox` - only exposed during encryption/decryption operations
 - **Don't access `block_data` before decryption**: `BlockChain` methods handle encryption/decryption transparently
 - **Don't modify height in `BlockHeader` manually**: Height is assigned automatically by `put_block()` based on block count
 - **Parent hash validation**: Genesis block has `parent_hash = [0u8; 64]`, not empty slice or Option
@@ -236,8 +215,8 @@ let signatures_cf = db.cf_handle("signatures").unwrap();
 - **No consensus mechanism**: PoW/PoS not implemented - library is purely for data persistence, not mining
 - **No network layer**: Purely local storage, no P2P or synchronization
 - **No block validation hooks**: Applications can't inject custom validation rules
-- **Hardcoded key name**: Key name `"root-key"` should be configurable via constructor parameter
 - **No key rotation**: Once blockchain is created with a key, changing keys requires manual migration
+- **Thread safety**: Database wrapped in Arc but struct not Send/Sync - needs review for multi-threaded use
 
 ## Quick Reference Examples
 
@@ -274,33 +253,27 @@ for block_result in chain.iter() {
 ### Complete Working Example
 ```rust
 use libblockchain::blockchain::BlockChain;
-use keyutils::{Keyring, SpecialKeyring};
-use keyutils::keytypes::user::User;
 use openssl::rsa::Rsa;
 use openssl::pkey::PKey;
 
-// Generate and load key
+// Generate RSA key pair
 let rsa = Rsa::generate(4096)?;
 let private_key = PKey::from_rsa(rsa)?;
-let der = private_key.private_key_to_der()?;
 
-let mut keyring = Keyring::attach_or_create(SpecialKeyring::Process)?;
-keyring.add_key::<User, _, _>("root-key", &der)?;
+// Create blockchain (key is moved and protected internally)
+let chain = BlockChain::new("./my_blockchain", private_key)?;
 
-// Create blockchain
-let chain = BlockChain::new("./my_blockchain", keyring)?;
-
-// Insert blocks
+// Insert blocks (automatically encrypted)
 chain.put_block(b"Genesis data".to_vec())?;
 chain.put_block(b"Block 1 data".to_vec())?;
 
-// Query and validate
+// Query and validate (automatically decrypted)
 let genesis = chain.get_block_by_height(0)?;
 chain.validate()?;
 println!("Blockchain has {} blocks", chain.block_count()?);
 ```
 
 ## Documentation References
-- **Keyring usage guide**: [docs/keyutils-usage.md](docs/keyutils-usage.md) - comprehensive guide to `keyutils` crate
-- **Example code**: [examples/read_key_from_process_keyring.rs](examples/read_key_from_process_keyring.rs) - demonstrates reading keys from keyring
+- **Example code**: [examples/read_key_from_process_keyring.rs](examples/read_key_from_process_keyring.rs) - demonstrates reading keys from kernel keyring (legacy example, not used by current API)
 - **API documentation**: Run `cargo doc --open` for full API reference
+- **Keyutils documentation**: [docs/keyutils-usage.md](docs/keyutils-usage.md) - comprehensive guide to `keyutils` crate (for reference, not currently used)

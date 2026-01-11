@@ -195,8 +195,8 @@ impl BlockChain {
             }
             // Validate block hash
             let computed_hash = (|| -> Result<openssl::hash::DigestBytes> {
-                let mut hashing_bytes = Vec::from(block.block_header.bytes());
-                hashing_bytes.extend_from_slice(&block.block_data);
+                let mut hashing_bytes = Vec::from(block.header_bytes());
+                hashing_bytes.extend_from_slice(&block.block_data());
                 Ok(openssl::hash::hash(
                     MessageDigest::sha512(),
                     &hashing_bytes,

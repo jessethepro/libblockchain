@@ -33,11 +33,11 @@ impl BlockChain {
         } else {
             // Get the previous block which is 1 less than block count
             let parent_block = self.get_block_by_height(block_count - 1)?;
-            let parent_hash = parent_block.block_hash;
+            let parent_hash = parent_block.block_hash();
             Block::new_regular_block(block_count, parent_hash, block_data)
         };
-        let height = block.block_header.height;
-        // Store block by UUID
+        let height = block.height();
+        // Store block by height
         let blocks_cf = db
             .cf_handle("blocks")
             .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
@@ -48,7 +48,7 @@ impl BlockChain {
         db.flush()
             .map_err(|e| anyhow!("Failed to flush database: {}", e))?;
 
-        Ok(block.block_header.height)
+        Ok(block.height())
     }
 
     pub fn put_signature(&self, height: u64, signature: Vec<u8>) -> Result<u64> {
@@ -65,14 +65,6 @@ impl BlockChain {
         Ok(height)
     }
 
-    /// Retrieve a block by its height in the chain
-    ///
-    /// # Arguments
-    /// * `height` - The block height (0 for genesis, 1 for first block after genesis, etc.)
-    ///
-    /// # Returns
-    /// - `Ok(Block)` if a block exists at this height
-    /// - `Err(_)` if no block exists at this height or a database/deserialization error occurs
     pub fn get_block_by_height(&self, height: u64) -> Result<Block> {
         let db = RocksDbModel::read_only(&self.db_path)
             .with_column_family("blocks")
@@ -122,28 +114,11 @@ impl BlockChain {
         Ok(signature)
     }
 
-    /// Get the height of the last block in the chain
-    ///
-    /// Returns the maximum height value in the height index. For an empty
-    /// blockchain, returns 0. Note that this reads from the database index,
-    /// not from the `current_height` mutex.
-    ///
-    /// # Returns
-    /// `Ok(u64)` - The height of the last block (0-indexed), or 0 for an empty chain
     pub fn get_max_height(&self) -> Result<u64> {
         let count = self.block_count()?;
         if count == 0 { Ok(0) } else { Ok(count - 1) }
     }
 
-    /// Delete the most recently inserted block
-    ///
-    /// Deletes the block at the highest height (current_height - 1).
-    /// Returns the UUID of the deleted block.
-    ///
-    /// # Returns
-    /// - `Ok(Some([u8; BLOCK_UID_SIZE]))` - UUID of the deleted block if blocks exist
-    /// - `Ok(None)` - If the blockchain is empty
-    /// - `Err(_)` - If a database or deserialization error occurs
     pub fn delete_latest_block(&self) -> Result<Option<u64>> {
         let db = RocksDbModel::new(&self.db_path)
             .with_column_family("blocks")
@@ -174,10 +149,6 @@ impl BlockChain {
         }
     }
 
-    /// Get the total number of blocks stored in the blockchain
-    ///
-    /// # Returns
-    /// The count of blocks in the database
     pub fn block_count(&self) -> Result<u64> {
         let db = RocksDbModel::read_only(&self.db_path)
             .with_column_family("blocks")
@@ -199,23 +170,23 @@ impl BlockChain {
         for (i, block_result) in self.iter().enumerate() {
             let block = block_result?;
             let expected_height = i as u64;
-            if block.block_header.height != expected_height {
+            if block.height() != expected_height {
                 return Err(anyhow!(
                     "Block height mismatch at index {}: expected {}, got {}",
                     i,
                     expected_height,
-                    block.block_header.height
+                    block.height()
                 ));
             }
             // Validate genesis block
             if expected_height == 0 {
-                if block.block_header.parent_hash != [0u8; BLOCK_HASH_SIZE] {
+                if block.parent_hash() != [0u8; BLOCK_HASH_SIZE] {
                     return Err(anyhow!("Genesis block has non-zero parent hash"));
                 }
             } else {
                 // Validate parent linkage
                 let parent_block = self.get_block_by_height(expected_height - 1)?;
-                if block.block_header.parent_hash != parent_block.block_hash {
+                if block.parent_hash() != parent_block.block_hash() {
                     return Err(anyhow!(
                         "Block at height {} has invalid parent hash",
                         expected_height
@@ -223,9 +194,15 @@ impl BlockChain {
                 }
             }
             // Validate block hash
-            let computed_hash =
-                openssl::hash::hash(MessageDigest::sha512(), &block.block_header.bytes())?;
-            if computed_hash.as_ref() != block.block_hash {
+            let computed_hash = (|| -> Result<openssl::hash::DigestBytes> {
+                let mut hashing_bytes = Vec::from(block.block_header.bytes());
+                hashing_bytes.extend_from_slice(&block.block_data);
+                Ok(openssl::hash::hash(
+                    MessageDigest::sha512(),
+                    &hashing_bytes,
+                )?)
+            })()?;
+            if computed_hash.as_ref() != block.block_hash() {
                 return Err(anyhow!(
                     "Block at height {} has invalid hash",
                     expected_height

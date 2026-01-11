@@ -20,6 +20,7 @@ pub const BLOCK_HEADER_SIZE: usize = BLOCK_HEIGHT_SIZE
     + BLOCK_TIMESTAMP_SIZE; // height + uid + version + parent_hash + timestamp
 use anyhow::{Result, anyhow};
 use openssl::hash::MessageDigest;
+use std::time::{SystemTime, UNIX_EPOCH};
 /// Block header containing cryptographically-relevant metadata
 ///
 /// The header is hashed with SHA-512 to produce the block's hash, which
@@ -34,36 +35,33 @@ use openssl::hash::MessageDigest;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockHeader {
     /// Height of the block in the blockchain (0 for genesis)
-    pub height: u64,
+    height: u64,
 
     /// Unique identifier (UUID v4) for this block
-    pub block_uid: [u8; 16],
+    block_uid: [u8; 16],
 
     /// Header version to support future upgrades (currently 1)
-    pub version: u32,
+    version: u32,
 
     /// SHA-512 hash of the parent block (all zeros for genesis)
-    pub parent_hash: [u8; 64],
+    parent_hash: [u8; 64],
 
-    /// Timestamp of block creation (UNIX epoch seconds)
-    pub timestamp: u64,
+    /// Timestamp of block creation
+    timestamp: u64,
 }
 
 impl BlockHeader {
-    /// Create a new block header with computed hash
-    ///
-    /// Generates a UUID v4 identifier and current timestamp automatically.
-    /// Computes SHA-512 hash of the serialized header.
-    ///
-    /// # Arguments
-    /// * `parent_hash` - SHA-512 hash of parent block (use `[0u8; 64]` for genesis)
-    /// * `height` - Block height in chain (0 for genesis, increments for each block)
-    ///
-    /// # Returns
-    /// New `BlockHeader` instance
-    pub fn new(parent_hash: [u8; BLOCK_HASH_SIZE], height: u64) -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
+    pub fn new(parent_hash: Vec<u8>, height: u64) -> Self {
         use uuid::Uuid;
+        if parent_hash.len() != BLOCK_HASH_SIZE {
+            panic!(
+                "Invalid parent_hash length: expected {}, got {}",
+                BLOCK_HASH_SIZE,
+                parent_hash.len()
+            );
+        }
+        let mut parent_hash_array = [0u8; BLOCK_HASH_SIZE];
+        parent_hash_array.copy_from_slice(&parent_hash);
 
         let block_uid = Uuid::new_v4().as_bytes().to_owned();
         let version = BLOCK_VERSION;
@@ -75,19 +73,27 @@ impl BlockHeader {
             height,
             block_uid,
             version,
-            parent_hash,
+            parent_hash: parent_hash_array,
             timestamp,
         }
     }
 
-    /// Deserialize a BlockHeader from bytes
-    ///
-    /// # Arguments
-    /// * `data` - Exactly 100 bytes in the format: height(8) || uid(16) || version(4) || parent_hash(64) || timestamp(8)
-    ///
-    /// # Errors
-    /// Returns error if data is not exactly 100 bytes
-    pub fn new_from_bytes(data: &[u8]) -> Result<Self> {
+    fn height(&self) -> u64 {
+        self.height
+    }
+    fn block_uid(&self) -> Vec<u8> {
+        self.block_uid.to_vec()
+    }
+    fn version(&self) -> u32 {
+        self.version
+    }
+    fn parent_hash(&self) -> Vec<u8> {
+        self.parent_hash.to_vec()
+    }
+    fn timestamp(&self) -> SystemTime {
+        UNIX_EPOCH + std::time::Duration::from_secs(self.timestamp)
+    }
+    fn new_from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() != 100 {
             return Err(anyhow!(
                 "Invalid data length for BlockHeader: expected 100, got {}",
@@ -127,6 +133,7 @@ impl BlockHeader {
             index += BLOCK_HASH_SIZE;
             phash
         };
+
         let timestamp = u64::from_le_bytes(
             data.get(index..index + BLOCK_TIMESTAMP_SIZE)
                 .and_then(|s| s.try_into().ok())
@@ -176,16 +183,16 @@ impl BlockHeader {
 #[derive(Debug, Clone)]
 pub struct Block {
     /// Block header with cryptographic metadata
-    pub block_header: BlockHeader,
+    block_header: BlockHeader,
 
     /// SHA-512 hash of the block header (64 bytes)
-    pub block_hash: [u8; 64],
+    block_hash: [u8; 64],
 
     /// Application-specific data (opaque to this library)
     ///
     /// In memory: plaintext application data
     /// In database: hybrid encrypted format requiring application's private key to decrypt
-    pub block_data: Vec<u8>,
+    block_data: Vec<u8>,
 }
 
 impl Block {
@@ -195,7 +202,7 @@ impl Block {
     /// * `height` - Block height in chain (must be > 0)
     /// * `parent_hash` - SHA-512 hash of the parent block
     /// * `block_data` - Application-specific data (will be encrypted when stored)
-    pub fn new_regular_block(height: u64, parent_hash: [u8; 64], block_data: Vec<u8>) -> Self {
+    pub fn new_regular_block(height: u64, parent_hash: Vec<u8>, block_data: Vec<u8>) -> Self {
         let block_header = BlockHeader::new(parent_hash, height);
         let mut hashing_data = Vec::from(block_header.bytes());
         hashing_data.extend_from_slice(&block_data);
@@ -211,27 +218,11 @@ impl Block {
         }
     }
 
-    /// Create a genesis block (height 0, no parent)
-    ///
-    /// Genesis blocks have height 0 and parent_hash of all zeros.
-    ///
-    /// # Arguments
-    /// * `block_data` - Application-specific data (will be encrypted when stored)
     pub fn new_genesis_block(block_data: Vec<u8>) -> Self {
         // Genesis block has height 0 and parent hash of all zeros.
-        Self::new_regular_block(0, [0u8; 64], block_data)
+        Self::new_regular_block(0, vec![0u8; 64], block_data)
     }
 
-    /// Deserialize a Block from bytes
-    ///
-    /// # Format
-    /// ```text
-    /// header(100) || block_hash(64) || data_len(4) || block_data(variable)
-    /// ```
-    /// Minimum size: 168 bytes (100 + 64 + 4)
-    ///
-    /// # Errors
-    /// Returns error if data is too short or malformed
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         // Header: height(8) + uid(16) + version(4) + parent_hash(64) + timestamp(8) = 100 bytes
         // Hash: 64 bytes
@@ -296,5 +287,26 @@ impl Block {
         // Serialize block data
         bytes.extend_from_slice(&self.block_data);
         bytes
+    }
+    pub fn block_hash(&self) -> Vec<u8> {
+        self.block_hash.to_vec()
+    }
+    pub fn parent_hash(&self) -> Vec<u8> {
+        self.block_header.parent_hash()
+    }
+    pub fn height(&self) -> u64 {
+        self.block_header.height()
+    }
+    pub fn block_uid(&self) -> Vec<u8> {
+        self.block_header.block_uid()
+    }
+    pub fn version(&self) -> u32 {
+        self.block_header.version()
+    }
+    pub fn timestamp(&self) -> SystemTime {
+        self.block_header.timestamp()
+    }
+    pub fn block_data(&self) -> Vec<u8> {
+        self.block_data.clone()
     }
 }

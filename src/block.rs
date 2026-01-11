@@ -309,4 +309,7 @@ impl Block {
     pub fn block_data(&self) -> Vec<u8> {
         self.block_data.clone()
     }
+    pub fn header_bytes(&self) -> Vec<u8> {
+        self.block_header.bytes()
+    }
 }

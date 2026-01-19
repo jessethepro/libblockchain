@@ -286,11 +286,6 @@ impl BlockChain<ReadWrite> {
     }
 }
 
-pub enum BlockChainMode {
-    ReadOnly,
-    ReadWrite,
-}
-
 pub fn open_read_only_chain(path: PathBuf) -> Result<BlockChain<ReadOnly>> {
     let open_chain = BlockChain::<OpenChain>::open(path)?;
     BlockChain::<ReadOnly>::open_read_only(open_chain)

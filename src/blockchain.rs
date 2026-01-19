@@ -17,25 +17,20 @@ pub struct BlockChain<Mode> {
     db_path: std::path::PathBuf,
 }
 
-struct Init {}
-
-struct OpenChain {}
-
-struct ReadOnly {
-    db: rocksdb::DBWithThreadMode<SingleThreaded>,
-}
-
-struct ReadWrite {
-    db: rocksdb::DBWithThreadMode<SingleThreaded>,
-}
-
-impl BlockChain<Init> {
-    pub fn init(path: PathBuf) -> Result<Self> {
-        Ok(Self {
-            mode: Init {},
-            db_path: path,
-        })
+impl<Mode> BlockChain<Mode> {
+    pub fn db_path(&self) -> &PathBuf {
+        &self.db_path
     }
+}
+
+pub struct OpenChain {}
+
+pub struct ReadOnly {
+    db: rocksdb::DBWithThreadMode<SingleThreaded>,
+}
+
+pub struct ReadWrite {
+    db: rocksdb::DBWithThreadMode<SingleThreaded>,
 }
 
 impl BlockChain<OpenChain> {
@@ -289,4 +284,22 @@ impl BlockChain<ReadWrite> {
             }
         }
     }
+}
+
+pub enum BlockChainMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+pub fn open_read_only_chain(path: PathBuf) -> Result<BlockChain<ReadOnly>> {
+    let open_chain = BlockChain::<OpenChain>::open(path)?;
+    BlockChain::<ReadOnly>::open_read_only(open_chain)
+}
+
+pub fn open_read_write_chain(path: PathBuf, create: bool) -> Result<BlockChain<ReadWrite>> {
+    if create {
+        BlockChain::<OpenChain>::open_or_create(path.clone())?;
+    }
+    let open_chain = BlockChain::<OpenChain>::open(path)?;
+    BlockChain::<ReadWrite>::open_read_write(open_chain)
 }

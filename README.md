@@ -1,19 +1,17 @@
 # libblockchain
 
-A generic, lightweight Rust library for creating and managing blockchain blocks with persistent storage. This library provides core block structures, cryptographic primitives, and RocksDB-backed persistence while remaining agnostic to the actual data you store in blocks. Private keys are stored securely in the Linux kernel keyring, isolated from userspace and never written to disk. The RSA private key is used to encrypt/decrypt unique AES-GCM-256 keys generated for each block.
+A generic, lightweight Rust library for creating and managing blockchain blocks with persistent RocksDB storage. This library provides core block structures and database-backed persistence while remaining agnostic to the actual data you store in blocks.
 
 ## Features
 
 - **Data-agnostic**: Store any application-specific data in blocks (JSON, binary, custom formats)
-- **Persistent storage**: Built-in RocksDB integration for blockchain persistence
+- **Persistent storage**: RocksDB-backed blockchain persistence
+- **Type-state pattern**: Compile-time enforcement of read-only vs read-write access
 - **Automatic height management**: Heights assigned automatically for sequential block ordering
-- **Hybrid encryption**: RSA-OAEP + AES-256-GCM encryption for block data
-- **Kernel keyring storage**: Private keys stored in Linux kernel keyring, isolated and secure, with configurable key names
-- **Height-based indexing**: Efficient block lookup by height
-- **Native RocksDB iterator**: Efficient traversal using RocksDB's built-in iteration
+- **Height-based indexing**: Efficient block lookup by sequential height
 - **Configurable database**: Multiple RocksDB presets (high performance, high durability, read-only)
-- **Type-safe**: Strong typing with clear separation between cryptographic and metadata concerns
 - **SHA-512 hashing**: 64-byte cryptographic hashes for block integrity
+- **Chain validation**: Verify parent-child hash relationships
 
 ## Installation
 
@@ -27,168 +25,144 @@ libblockchain = { git = "https://github.com/jessethepro/libblockchain.git" }
 ### Build Requirements
 
 **Important**: This library compiles RocksDB and OpenSSL from source:
-- **RocksDB**: Compiled with `mt_static` feature (multi-threaded static linking)
+- **RocksDB**: Compiled with `mt_static` feature (static linking)
 - **OpenSSL**: Compiled with `vendored` feature (builds from source)
 
 The first build may take **5-10 minutes** due to C++ compilation. You'll need:
 - C++ compiler (g++ or clang)
 - CMake (for RocksDB)
 - Standard build tools (make, etc.)
-- Linux kernel 3.10+ (for keyring support)
 
 Subsequent builds are faster as dependencies are cached.
 
 ## Quick Start
 
 ```rust
-use libblockchain::blockchain::BlockChain;
-use keyutils::{Keyring, SpecialKeyring};
+use libblockchain::blockchain::open_read_write_chain;
 
-// Attach to the process keyring (keys must be pre-loaded using keyctl)
-// Example: keyctl padd user my-app-key @p < private_key.der
-let keyring = Keyring::attach(SpecialKeyring::Process)?;
+// Create or open a blockchain
+let chain = open_read_write_chain("./my_blockchain".into(), true)?;
 
-// Create or open a blockchain using the keyring with a custom key name
-let chain = BlockChain::new("./my_blockchain", keyring, "my-app-key".to_string())?;
-
-// Insert blocks (automatically encrypted with AES-256-GCM + RSA-OAEP)
+// Insert blocks (height auto-assigned)
 chain.put_block(b"Genesis data".to_vec())?;
 chain.put_block(b"Block 1 data".to_vec())?;
+chain.put_block(b"Block 2 data".to_vec())?;
 
-// Query blocks (automatically decrypted)
+// Query blocks
 let genesis = chain.get_block_by_height(0)?;
-let max_height = chain.get_max_height()?;
-let latest = chain.get_block_by_height(max_height)?;
+println!("Genesis data: {:?}", genesis.block_data());
 
-// Iterate over all blocks
-for block_result in chain.iter() {
-    let block = block_result?;
-    println!("Block {}: {:?}", block.block_header.height, block.block_hash);
+// Get latest block
+let count = chain.block_count()?;
+if count > 0 {
+    let latest = chain.get_block_by_height(count - 1)?;
+    println!("Latest block data: {:?}", latest.block_data());
 }
 
 // Validate entire blockchain integrity
 chain.validate()?;
+println!("Blockchain has {} blocks and is valid!", count);
 ```
 
 ## Architecture
 
-### Components
+### Core Components
 
-- **`blockchain`**: Persistent blockchain storage with RocksDB
-  - Height-based block storage (blocks keyed by u64 height)
-  - Native RocksDB iterator for efficient sequential access
-  - Integrated hybrid RSA-OAEP + AES-256-GCM encryption
-  - Private keys stored in Linux kernel keyring via `keyutils`
-  - Automatic public key extraction from private keys
-  - Thread-safe database operations
+**Block Structures** ([src/block.rs](src/block.rs)):
+- `BlockHeader`: Metadata (height, UUID, version, parent_hash, timestamp) - 100 bytes fixed
+- `Block`: Complete block with header, SHA-512 hash, and data payload
+- Height stored in header, assigned on insertion by counting existing blocks
 
-- **`block`**: Core block structures
-  - Block and BlockHeader with SHA-512 hashing
-  - UUID-based block identification
-  - Serialization/deserialization support
+**Blockchain Storage** ([src/blockchain.rs](src/blockchain.rs)):
+- **Type-state pattern**: `OpenChain`, `ReadOnly`, `ReadWrite` for compile-time safety
+- Two RocksDB column families: `blocks` and `signatures`
+- Database is `DBWithThreadMode<SingleThreaded>` (not thread-safe)
+- Helper functions: `open_read_only_chain()`, `open_read_write_chain()`
 
-- **`db_model`**: RocksDB configuration and presets
-  - High performance, high durability, and read-only configurations
-  - Builder pattern for custom settings
-  - Column families for organizing data
+**Database Configuration** ([src/db_model.rs](src/db_model.rs)):
+- Presets: `high_performance()`, `high_durability()`, `read_only()`
+- Builder pattern for customization
+- Defaults: 512MB block cache, 64MB write buffer, LZ4 compression
 
 ### Database Structure
 
 The blockchain uses two RocksDB column families:
-- **`blocks`**: Maps block height (u64) → encrypted Block data
-- **`signatures`**: Maps block height (u64) → signature data
+- **`blocks`**: Maps block height (u64) → Block data
+- **`signatures`**: Maps block height (u64) → signature bytes
 
-### Key Design Decisions
+### Type-State Pattern
 
-- **Opaque data**: `block_data: Vec<u8>` allows any application-specific payload
-- **Selective encryption**: Only `block_data` is encrypted; BlockHeader and hash stored in plaintext
-- **Hybrid encryption**: AES-256-GCM for data, RSA-OAEP (SHA-256 MGF1) for AES key encapsulation
-- **Kernel keyring storage**: Private keys stored in Linux kernel keyring, isolated from userspace
-- **No disk persistence**: Keys remain in kernel memory, never written to disk
-- **Height-based storage**: Blocks keyed directly by height for efficient sequential access
-- **Automatic height assignment**: Heights managed internally, assigned sequentially
+Compile-time enforcement prevents calling write methods on read-only chains:
+
+```rust
+use libblockchain::blockchain::{BlockChain, ReadOnly, ReadWrite};
+
+// Read-only access
+let ro_chain = BlockChain::<ReadOnly>::open_read_only(...)?;
+let block = ro_chain.get_block_by_height(0)?;  // OK
+// ro_chain.put_block(data)?;  // Compile error!
+
+// Read-write access
+let rw_chain = BlockChain::<ReadWrite>::open_read_write(...)?;
+rw_chain.put_block(data)?;  // OK
+```
 
 ## Usage Examples
 
-### Setting Up Keys
+### Opening a Blockchain
 
 ```rust
-use keyutils::{Keyring, SpecialKeyring};
-use openssl::rsa::Rsa;
-use openssl::pkey::PKey;
+use libblockchain::blockchain::{BlockChain, OpenChain, open_read_write_chain, open_read_only_chain};
 
-// Generate a new RSA key pair (4096 bits recommended)
-let rsa = Rsa::generate(4096)?;
-let private_key = PKey::from_rsa(rsa)?;
+// Method 1: Using helper functions (recommended)
+let chain = open_read_write_chain("./my_blockchain".into(), true)?;
 
-// Export as DER for keyring storage
-let der = private_key.private_key_to_der()?;
+// Method 2: Type-state pattern (more control)
+let open_chain = BlockChain::<OpenChain>::open_or_create("./my_blockchain".into())?;
+let rw_chain = BlockChain::<ReadWrite>::open_read_write(open_chain)?;
 
-// Add key to the Linux kernel keyring with a custom name
-let mut keyring = Keyring::attach_or_create(SpecialKeyring::Process)?;
-keyring.add_key::<keyutils::keytypes::user::User, _, _>("my-app-key", &der)?;
-
-// Or from command line:
-// openssl genrsa 4096 | openssl rsa -outform DER | keyctl padd user my-app-key @p
+// Read-only access
+let ro_chain = open_read_only_chain("./my_blockchain".into())?;
 ```
 
-### Creating and Using a Blockchain
+### Inserting Blocks
 
 ```rust
-use libblockchain::blockchain::BlockChain;
-use keyutils::{Keyring, SpecialKeyring};
+// Heights are assigned automatically (0, 1, 2, ...)
+let height0 = chain.put_block(b"Genesis data".to_vec())?;
+let height1 = chain.put_block(b"Block 1 data".to_vec())?;
 
-// Attach to the keyring
-let keyring = Keyring::attach(SpecialKeyring::Process)?;
-
-// Create blockchain with the key name you used when adding the key
-let chain = BlockChain::new("./my_blockchain", keyring, "my-app-key".to_string())?;
-
-// Insert blocks (automatic height assignment and encryption)
-chain.put_block(b"Genesis data".to_vec())?;
-chain.put_block(b"Transaction 1".to_vec())?;
-chain.put_block(b"Transaction 2".to_vec())?;
-
-println!("Total blocks: {}", chain.block_count()?);
+println!("Inserted blocks at heights: {}, {}", height0, height1);
 ```
 
 ### Querying Blocks
 
 ```rust
-// By height (automatically decrypted)
-let genesis = chain.get_block_by_height(0)?;
-let block5 = chain.get_block_by_height(5)?;
+// By height
+let block = chain.get_block_by_height(5)?;
 
-// Access decrypted data directly
-println!("Genesis data: {:?}", String::from_utf8_lossy(&genesis.block_data));
+// Access block fields
+println!("Height: {}", block.height());
+println!("Hash: {:?}", block.block_hash());
+println!("Parent: {:?}", block.parent_hash());
+println!("Data: {:?}", block.block_data());
 
 // Get latest block
-let max_height = chain.get_max_height()?;
-if max_height > 0 {
-    let latest = chain.get_block_by_height(max_height)?;
-    println!("Latest block data: {:?}", String::from_utf8_lossy(&latest.block_data));
+let count = chain.block_count()?;
+if count > 0 {
+    let latest = chain.get_block_by_height(count - 1)?;
 }
 ```
 
 ### Iterating Over Blocks
 
 ```rust
-// Process all blocks in order (automatically decrypted)
-for block_result in chain.iter() {
-    let block = block_result?;
-    println!("Block {} at timestamp {}: hash {:?}", 
-             block.block_header.height,
-             block.block_header.timestamp,
-             block.block_hash);
+// Manual iteration by height
+let count = chain.block_count()?;
+for height in 0..count {
+    let block = chain.get_block_by_height(height)?;
+    println!("Block {}: {:?}", height, block.block_hash());
 }
-
-// Collect into vector
-let blocks: Vec<_> = chain.iter()
-    .collect::<anyhow::Result<Vec<_>>>()?;
-
-// Validate entire blockchain
-chain.validate()?;
-println!("Blockchain is valid!");
 ```
 
 ### Storing Custom Data
@@ -201,103 +175,116 @@ struct Transaction {
     from: String,
     to: String,
     amount: u64,
-    timestamp: u64,
 }
 
-let transaction = Transaction {
+let tx = Transaction {
     from: "Alice".to_string(),
     to: "Bob".to_string(),
     amount: 100,
-    timestamp: 1701475200,
 };
 
-// Serialize and insert (automatically encrypted)
-let data = serde_json::to_vec(&transaction)?;
+// Serialize and insert
+let data = serde_json::to_vec(&tx)?;
 chain.put_block(data)?;
 
-// Later, retrieve and deserialize (automatically decrypted)
-let max_height = chain.get_max_height()?;
-let block = chain.get_block_by_height(max_height)?;
-let tx: Transaction = serde_json::from_slice(&block.block_data)?;
-println!("Transaction: {} -> {}, amount: {}", tx.from, tx.to, tx.amount);
+// Later, retrieve and deserialize
+let count = chain.block_count()?;
+let block = chain.get_block_by_height(count - 1)?;
+let retrieved_tx: Transaction = serde_json::from_slice(&block.block_data())?;
 ```
 
 ### Custom Database Configuration
 
 ```rust
-use libblockchain::db_model::RocksDbModel;
+use libblockchain::db_model::{RocksDbModel, CompressionType};
 
-// Use a preset configuration
+// Use a preset
 let db = RocksDbModel::high_performance("./fast_blockchain")
     .with_column_family("blocks")
     .with_column_family("signatures")
     .open()?;
 
-// Or fully customize
+// Fully customize
 let db = RocksDbModel::new("./custom_blockchain")
     .with_block_cache_size_mb(2048)  // 2GB cache
-    .with_write_buffer_size_mb(256)  // 256MB write buffer
-    .with_compression(libblockchain::db_model::CompressionType::Zstd)
-    .with_sync_writes(true)
+    .with_write_buffer_size_mb(256)
+    .with_compression(CompressionType::Zstd)
     .with_column_family("blocks")
     .with_column_family("signatures")
     .open()?;
 ```
 
+### Block Validation
+
+```rust
+// Validate entire chain
+chain.validate()?;
+println!("Blockchain is valid!");
+
+// validate() checks:
+// - Heights are sequential (0, 1, 2, ...)
+// - Genesis block has parent_hash = [0u8; 64]
+// - Each block's parent_hash matches previous block's hash
+// - Each block's hash is correctly computed
+```
+
 ## API Reference
 
-### `BlockChain`
+### `BlockChain<Mode>`
 
-**Creation:**
-- `new<P: AsRef<Path>>(path: P, proc_keyring: Keyring, app_key_name: String) -> Result<Self>`: Open or create blockchain using Linux kernel keyring for key storage with a custom key name
+**Opening:**
+- `BlockChain::<OpenChain>::open(path) -> Result<Self>`: Open existing blockchain
+- `BlockChain::<OpenChain>::open_or_create(path) -> Result<Self>`: Create if missing
+- `BlockChain::<ReadOnly>::open_read_only(OpenChain) -> Result<Self>`: Convert to read-only
+- `BlockChain::<ReadWrite>::open_read_write(OpenChain) -> Result<Self>`: Convert to read-write
 
-**Insertion:**
-- `put_block(&self, block_data: Vec<u8>) -> Result<()>`: Insert new block (automatically encrypted with AES-256-GCM + RSA-OAEP)
-- `put_signature(&self, height: u64, signature: Vec<u8>) -> Result<()>`: Store signature for a block
+**Helper Functions:**
+- `open_read_only_chain(path) -> Result<BlockChain<ReadOnly>>`
+- `open_read_write_chain(path, create: bool) -> Result<BlockChain<ReadWrite>>`
 
-**Querying:**
-- `get_block_by_height(&self, height: u64) -> Result<Block>`: Get block by height (automatically decrypted)
-- `get_signature_by_height(&self, height: u64) -> Result<Vec<u8>>`: Get signature for a block
-- `get_max_height(&self) -> Result<u64>`: Get height of last block
-- `block_count(&self) -> Result<u64>`: Get total block count
-- `delete_latest_block(&self) -> Result<Option<u64>>`: Delete the most recently inserted block
+**ReadOnly Operations:**
+- `block_count() -> Result<u64>`: Total blocks in chain
+- `get_block_by_height(height: u64) -> Result<Block>`: Retrieve block by height
+- `get_signature_by_height(height: u64) -> Result<Vec<u8>>`: Retrieve signature
+- `validate() -> Result<()>`: Verify entire chain integrity
 
-**Validation:**
-- `validate(&self) -> Result<()>`: Validate entire blockchain integrity
-
-**Iteration:**
-- `iter(&self) -> BlockIterator<'_>`: Create RocksDB-backed iterator over all blocks (automatically decrypts)
+**ReadWrite Operations (in addition to ReadOnly):**
+- `put_block(data: Vec<u8>) -> Result<u64>`: Insert block, returns height
+- `put_signature(height: u64, sig: Vec<u8>) -> Result<u64>`: Store signature
+- `delete_last_block() -> Result<Option<u64>>`: Delete most recent block
 
 ### `Block`
 
-```rust
-pub struct Block {
-    pub block_header: BlockHeader,
-    pub block_hash: [u8; 64],        // SHA-512 hash (64 bytes)
-    pub block_data: Vec<u8>,         // Application data (decrypted when retrieved)
-}
-```
+**Creation:**
+- `Block::new_genesis_block(data: Vec<u8>) -> Self`: Height 0, parent_hash = [0; 64]
+- `Block::new_regular_block(height, parent_hash, data) -> Self`: Height > 0
 
-**Methods:**
-- `new_genesis_block(data: Vec<u8>) -> Self`: Create genesis block (height 0)
-- `new_regular_block(height: u64, parent_hash: [u8; 64], data: Vec<u8>) -> Self`: Create regular block
-- `bytes(&self) -> Vec<u8>`: Serialize block to bytes
-- `from_bytes(bytes: &[u8]) -> Result<Self>`: Deserialize block from bytes
+**Accessors:**
+- `height() -> u64`: Block height
+- `block_hash() -> Vec<u8>`: 64-byte SHA-512 hash
+- `parent_hash() -> Vec<u8>`: Parent block's hash
+- `block_data() -> Vec<u8>`: Application data
+- `block_uid() -> Vec<u8>`: 16-byte UUID
+- `version() -> u32`: Block version (currently 1)
+- `timestamp() -> SystemTime`: Creation timestamp
+
+**Serialization:**
+- `bytes() -> Vec<u8>`: Serialize to storage format
+- `from_bytes(&[u8]) -> Result<Block>`: Deserialize from bytes
 
 ### `BlockHeader`
 
 ```rust
 pub struct BlockHeader {
-    pub height: u64,                  // Block height in chain
-    pub block_uid: [u8; 16],         // 16-byte UUID
-    pub version: u32,                 // Header version (currently 1)
-    pub parent_hash: [u8; 64],       // SHA-512 hash of parent block
-    pub timestamp: u64,               // Unix timestamp (seconds since epoch)
+    height: u64,              // Block height (0 for genesis)
+    block_uid: [u8; 16],     // UUID v4
+    version: u32,             // Currently 1
+    parent_hash: [u8; 64],   // SHA-512 of parent (zeros for genesis)
+    timestamp: u64,           // Unix timestamp
 }
 ```
 
-**Methods:**
-- `generate_block_hash(&self) -> [u8; 64]`: Generate SHA-512 hash of header
+Serialization: 100 bytes = height(8) + uid(16) + version(4) + parent_hash(64) + timestamp(8)
 
 ### `RocksDbModel`
 
@@ -307,48 +294,59 @@ pub struct BlockHeader {
 - `RocksDbModel::high_durability(path)`: Sync writes, optimized for safety
 - `RocksDbModel::read_only(path)`: Read-only access
 
-**Builder methods:**
-- `with_block_cache_size_mb(mb)`: Set cache size in megabytes
-- `with_write_buffer_size_mb(mb)`: Set write buffer size in megabytes
-- `with_compression(type)`: Set compression algorithm
-- `with_sync_writes(bool)`: Enable/disable sync writes
-- `with_column_family(name)`: Add a column family
+**Builder Methods:**
+- `with_block_cache_size_mb(mb)`: Cache size in MB (default: 512)
+- `with_write_buffer_size_mb(mb)`: Write buffer in MB (default: 64)
+- `with_compression(type)`: Compression algorithm (default: LZ4)
+- `with_column_family(name)`: Add column family
 - `open() -> Result<DB>`: Open the database
+
+## Security Considerations
+
+⚠️ **No Encryption**: This library stores all block data as plaintext in RocksDB.
+
+- **Block Integrity**: SHA-512 hashes detect tampering
+- **Chain Validation**: Parent hash links ensure sequential integrity
+- **No Authentication**: Anyone with filesystem access can read/modify the database
+- **No Encryption**: All `block_data` stored as plaintext
+- **Application Responsibility**: Implement encryption at the application layer if needed
+
+**Access Control**: RocksDB is an embedded database with no built-in access control. Security relies on:
+- Operating system file permissions
+- Application-level encryption (before calling `put_block()`)
+- Process isolation
 
 ## Thread Safety
 
-`BlockChain` is safe to share across threads:
-- RocksDB provides thread-safe concurrent reads
-- Write operations are serialized by RocksDB's internal locking
-- Multiple threads can safely query blocks concurrently
-- Insert operations are automatically serialized
+⚠️ **Single-Threaded**: The database is `DBWithThreadMode<SingleThreaded>` and **cannot be shared across threads**.
 
-## Security
+To use in multi-threaded applications, you would need to:
+1. Change to `MultiThreaded` mode in the code
+2. Add proper `Send`/`Sync` trait implementations
+3. Handle concurrent access carefully
 
-- **Hybrid Encryption**: RSA-OAEP + AES-256-GCM for each block
-- **Authenticated Encryption**: AES-GCM detects tampering
-- **Key Encapsulation**: RSA-OAEP (SHA-256 MGF1) for secure AES key distribution
-- **Random Nonces**: Unique 96-bit nonce per block ensures semantic security
-- **Kernel Keyring**: Private keys isolated in kernel memory, never on disk
-- **Process Isolation**: Keys accessible only within the process keyring scope
-- **SHA-512 Hashing**: Cryptographic block integrity verification
-- **Chain Validation**: Parent-child hash relationships enforced
+## Performance Tips
 
-## Dependencies
+**Read Performance:**
+- Use read-only mode when not modifying: `open_read_only_chain()`
+- Adjust block cache size: `RocksDbModel::new(path).with_block_cache_size_mb(2048)`
+- Sequential reads by height are efficient
 
-Core dependencies:
-- `rocksdb`: Embedded database (0.24)
-- `openssl`: Cryptographic operations (0.10)
-- `keyutils`: Linux kernel keyring access (0.4)
-- `anyhow`: Error handling (1.0)
-- `serde`: Serialization (1.0)
-- `uuid`: Block identifiers (1.18)
-- `rand`: Random generation (0.9)
+**Write Performance:**
+- Use `high_performance()` preset for write-heavy workloads
+- Batch insertions if possible
+- Database automatically flushes after each `put_block()`
+
+**Storage:**
+- Blocks stored with minimal overhead
+- Compression enabled by default (LZ4)
+- Use `CompressionType::Zstd` for better compression ratio
 
 ## What This Library Does NOT Include
 
 This is a foundational library designed to be extended by applications. It does **not** include:
 
+- Encryption/decryption (store encrypted data yourself if needed)
 - Consensus mechanisms (PoW, PoS, PBFT, etc.)
 - Networking/peer-to-peer communication
 - Transaction validation logic
@@ -358,14 +356,34 @@ This is a foundational library designed to be extended by applications. It does 
 - Wallet management
 - Cryptocurrency features
 
+## Testing
+
+```bash
+cargo check    # Fast type checking
+cargo build    # Full build (first time: 5-10 min)
+cargo test     # Run tests (currently empty)
+cargo clippy   # Lint checking
+cargo doc --open  # View documentation
+```
+
+## Dependencies
+
+Core dependencies:
+- `rocksdb` 0.24: Embedded database with `mt_static` feature
+- `openssl` 0.10: SHA-512 hashing with `vendored` feature
+- `anyhow` 1.0: Error handling
+- `uuid` 1.18: Block identifiers
+- `serde` 1.0: Optional serialization support
+
+See [Cargo.toml](Cargo.toml) for complete list.
+
 ## Contributing
 
 Contributions are welcome! Please ensure:
+- Code compiles with `cargo check`
+- Clippy warnings addressed (`cargo clippy`)
 - Data format agnosticism is maintained
-- Thread safety is preserved
-- Comprehensive test coverage
-- Clear documentation
-- Code passes `cargo clippy` and `cargo test`
+- Documentation is updated
 
 ## License
 
@@ -377,5 +395,4 @@ Copyright (c) 2025 jessethepro
 
 Built with:
 - [RocksDB](https://rocksdb.org/) - High-performance embedded database
-- [OpenSSL](https://www.openssl.org/) - Cryptographic library
-- [keyutils](https://people.redhat.com/~dhowells/keyutils/) - Linux kernel keyring interface
+- [OpenSSL](https://www.openssl.org/) - Cryptographic hashing

@@ -21,12 +21,15 @@ A **generic, data-agnostic blockchain library** with persistent RocksDB storage.
 - Hash computed: `SHA512(header_bytes || block_data)` using OpenSSL
 
 **src/blockchain.rs**: RocksDB-backed storage with **type-state pattern**
-- **Type states**: `OpenChain`, `ReadOnly`, `ReadWrite` - enforces read-only vs read-write at compile time
-- Two RocksDB column families: `blocks` (height u64 → Block), `signatures` (height u64 → signature bytes)
+- **Type states**: `ReadOnly`, `ReadWrite` - enforces read-only vs read-write at compile time
+- Three RocksDB column families: `blocks` (height u64 → Block), `signatures` (height u64 → signature bytes), `validation_cache` (tracks last validated height)
+- **MAX_BLOCK_SIZE**: 100MB limit enforced on `put_block()`
+- **Auto-validation**: `put_block()` automatically validates new blocks incrementally
+- **Validation methods**: `validate_full()` (O(n)), `validate_incremental()` (O(new blocks only)), `validate()` (wrapper for incremental)
+- **Iterator**: `iter()` method returns `BlockIterator` for efficient traversal
 - Database is `DBWithThreadMode<SingleThreaded>` - NOT thread-safe currently
 - NO encryption - blocks stored as plaintext serialized bytes
-- Typical workflow: `BlockChain::<OpenChain>::open(path)` → `.open_read_only()` or `.open_read_write()`
-- Helper functions: `open_read_only_chain(path)`, `open_read_write_chain(path, create_if_missing)`
+- Helper functions: `open_read_only_chain(path)`, `open_read_write_chain(path)`
 
 **src/db_model.rs**: RocksDB configuration builder
 - Presets: `RocksDbModel::high_performance()`, `::high_durability()`, `::read_only()`
@@ -82,16 +85,21 @@ open_read_write_chain(path: PathBuf, create: bool)     // open_or_create() + ope
 .block_count()                          // Total blocks in chain
 .get_block_by_height(height: u64)       // Retrieve block by height (0-indexed)
 .get_signature_by_height(height: u64)   // Retrieve signature for block
-.validate()                             // Verify entire chain integrity (parent hashes)
+.validate()                             // Incremental validation (fast)
+.validate_full()                        // Full O(n) validation
+.validate_incremental() -> Result<u64>  // Validate new blocks, return validated height
+.iter() -> Result<BlockIterator>        // Iterator over all blocks
 ```
 
-### ReadWrite Operations
+### ReadWrite Operations (includes all ReadOnly operations)
 ```rust
-.block_count()                          // Also available on ReadWrite
-.get_block_by_height(height: u64)       // Also available on ReadWrite
-.put_block(data: Vec<u8>) -> Result<u64>       // Insert block, returns height
+.put_block(data: Vec<u8>) -> Result<u64>       // Insert block (max 100MB), auto-validates, returns height
 .put_signature(height: u64, sig: Vec<u8>)      // Store signature
 .delete_last_block() -> Result<Option<u64>>    // Delete most recent block
+.validate()                                    // Incremental validation
+.validate_full()                               // Full O(n) validation
+.validate_incremental() -> Result<u64>         // Validate new blocks, updates cache
+.iter() -> Result<BlockIterator>               // Iterator over all blocks
 ```
 
 ### Block Operations
@@ -214,9 +222,9 @@ let open_chain = BlockChain::<OpenChain>::open(path)?;
 - **Thread safety**: Database is `SingleThreaded` - NOT thread-safe, cannot share across threads
 - **Column family handles**: Always check `cf_handle()` returns `Some` before using
 - **Edition 2024**: Cargo.toml uses `edition = "2024"` - requires recent stable Rust (1.85+)
-- **No `get_latest_block()` method**: Use `get_block_by_height(block_count() - 1)?` pattern
-- **Type-state limitations**: Can't convert from ReadWrite back to ReadOnly without reopening
-- **ReadWrite operations reopen database**: `block_count()` and `get_block_by_height()` on ReadWrite internally reopen as ReadOnly
+- **Block size limit**: 100MB maximum enforced - attempting to insert larger blocks will error
+- **Auto-validation**: `put_block()` automatically validates incrementally - no need to call `validate()` after each insert
+- **Validation cache**: Stored in `validation_cache` column family - improves incremental validation performance
 
 ## Incomplete/Future Work
 - **No tests**: `tests/` directory exists but is empty - add integration tests
@@ -225,7 +233,6 @@ let open_chain = BlockChain::<OpenChain>::open(path)?;
 - **No network layer**: Purely local storage, no P2P or synchronization
 - **No block validation hooks**: Applications can't inject custom validation rules
 - **Thread safety**: Single-threaded database - needs `MultiThreaded` mode for concurrent access
-- **No iterator**: No built-in iterator for traversing all blocks (despite example showing `.iter()`)
 
 ## Quick Reference Examples
 
@@ -251,7 +258,13 @@ let result = db.get_cf(blocks_cf, key)?;
 
 ### Iteration Pattern
 ```rust
-// No built-in iterator - manually iterate by height
+// Use built-in iterator (efficient)
+for block_result in chain.iter()? {
+    let block = block_result?;
+    println!("Height: {}, Data: {:?}", block.height(), block.block_data());
+}
+
+// Or manual iteration by height
 let count = chain.block_count()?;
 for height in 0..count {
     let block = chain.get_block_by_height(height)?;
@@ -264,17 +277,23 @@ for height in 0..count {
 use libblockchain::blockchain::open_read_write_chain;
 
 // Create or open blockchain
-let chain = open_read_write_chain("./my_blockchain".into(), true)?;
+let chain = open_read_write_chain("./my_blockchain".into())?;
 
-// Insert blocks (height auto-assigned)
+// Insert blocks (auto-validated, max 100MB each)
 chain.put_block(b"Genesis data".to_vec())?;
 chain.put_block(b"Block 1 data".to_vec())?;
 
-// Query blocks
+// Iterate over blocks
+for block_result in chain.iter()? {
+    let block = block_result?;
+    println!("Block {}: {:?}", block.height(), block.block_data());
+}
+
+// Query specific block
 let genesis = chain.get_block_by_height(0)?;
 println!("Genesis data: {:?}", genesis.block_data());
 
-// Validate chain integrity
+// Validate chain integrity (incremental - fast)
 chain.validate()?;
 println!("Blockchain has {} blocks", chain.block_count()?);
 ```

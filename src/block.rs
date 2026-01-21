@@ -51,14 +51,14 @@ pub struct BlockHeader {
 }
 
 impl BlockHeader {
-    pub fn new(parent_hash: Vec<u8>, height: u64) -> Self {
+    pub fn new(parent_hash: Vec<u8>, height: u64) -> Result<Self> {
         use uuid::Uuid;
         if parent_hash.len() != BLOCK_HASH_SIZE {
-            panic!(
+            return Err(anyhow!(
                 "Invalid parent_hash length: expected {}, got {}",
                 BLOCK_HASH_SIZE,
                 parent_hash.len()
-            );
+            ));
         }
         let mut parent_hash_array = [0u8; BLOCK_HASH_SIZE];
         parent_hash_array.copy_from_slice(&parent_hash);
@@ -67,15 +67,15 @@ impl BlockHeader {
         let version = BLOCK_VERSION;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
+            .map_err(|e| anyhow!("System time error: {}", e))?
             .as_secs();
-        Self {
+        Ok(Self {
             height,
             block_uid,
             version,
             parent_hash: parent_hash_array,
             timestamp,
-        }
+        })
     }
 
     fn height(&self) -> u64 {
@@ -105,31 +105,31 @@ impl BlockHeader {
         let height = u64::from_le_bytes(
             data.get(index..index + BLOCK_HEIGHT_SIZE)
                 .and_then(|s| s.try_into().ok())
-                .expect("Failed to read height from block header"),
+                .ok_or_else(|| anyhow!("Failed to read height from block header"))?,
         );
         index += BLOCK_HEIGHT_SIZE;
 
         let block_uid = {
             let mut uid = [0u8; BLOCK_UID_SIZE];
-            uid.copy_from_slice(
-                data.get(index..index + BLOCK_UID_SIZE)
-                    .expect("Failed to read block_uid from header"),
-            );
+            let slice = data
+                .get(index..index + BLOCK_UID_SIZE)
+                .ok_or_else(|| anyhow!("Failed to read block_uid from header"))?;
+            uid.copy_from_slice(slice);
             index += BLOCK_UID_SIZE;
             uid
         };
         let version = u32::from_le_bytes(
             data.get(index..index + BLOCK_VERSION_SIZE)
                 .and_then(|s| s.try_into().ok())
-                .expect("Failed to read version from block header"),
+                .ok_or_else(|| anyhow!("Failed to read version from block header"))?,
         );
         index += BLOCK_VERSION_SIZE;
         let parent_hash = {
             let mut phash = [0u8; BLOCK_HASH_SIZE];
-            phash.copy_from_slice(
-                data.get(index..index + BLOCK_HASH_SIZE)
-                    .expect("Failed to read parent_hash from header"),
-            );
+            let slice = data
+                .get(index..index + BLOCK_HASH_SIZE)
+                .ok_or_else(|| anyhow!("Failed to read parent_hash from header"))?;
+            phash.copy_from_slice(slice);
             index += BLOCK_HASH_SIZE;
             phash
         };
@@ -137,7 +137,7 @@ impl BlockHeader {
         let timestamp = u64::from_le_bytes(
             data.get(index..index + BLOCK_TIMESTAMP_SIZE)
                 .and_then(|s| s.try_into().ok())
-                .expect("Failed to read timestamp from block header"),
+                .ok_or_else(|| anyhow!("Failed to read timestamp from block header"))?,
         );
 
         Ok(BlockHeader {
@@ -202,23 +202,31 @@ impl Block {
     /// * `height` - Block height in chain (must be > 0)
     /// * `parent_hash` - SHA-512 hash of the parent block
     /// * `block_data` - Application-specific data (will be encrypted when stored)
-    pub fn new_regular_block(height: u64, parent_hash: Vec<u8>, block_data: Vec<u8>) -> Self {
-        let block_header = BlockHeader::new(parent_hash, height);
-        let mut hashing_data = Vec::from(block_header.bytes());
+    pub fn new_regular_block(
+        height: u64,
+        parent_hash: Vec<u8>,
+        block_data: Vec<u8>,
+    ) -> Result<Self> {
+        let block_header = BlockHeader::new(parent_hash, height)?;
+        let mut hashing_data = block_header.bytes();
         hashing_data.extend_from_slice(&block_data);
-        let block_hash = openssl::hash::hash(MessageDigest::sha512(), &hashing_data)
-            .expect("Failed to compute block hash")
-            .as_ref()
-            .try_into()
-            .expect("Hash length mismatch");
-        Self {
+        let hash_bytes = openssl::hash::hash(MessageDigest::sha512(), &hashing_data)
+            .map_err(|e| anyhow!("Failed to compute block hash: {}", e))?;
+        let block_hash = hash_bytes.as_ref().try_into().map_err(|_| {
+            anyhow!(
+                "Hash length mismatch: expected {}, got {}",
+                BLOCK_HASH_SIZE,
+                hash_bytes.len()
+            )
+        })?;
+        Ok(Self {
             block_header,
             block_hash,
             block_data,
-        }
+        })
     }
 
-    pub fn new_genesis_block(block_data: Vec<u8>) -> Self {
+    pub fn new_genesis_block(block_data: Vec<u8>) -> Result<Self> {
         // Genesis block has height 0 and parent hash of all zeros.
         Self::new_regular_block(0, vec![0u8; 64], block_data)
     }

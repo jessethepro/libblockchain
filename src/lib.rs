@@ -5,5 +5,6 @@ pub mod block;
 pub mod blockchain;
 pub mod db_model;
 
-// Re-export uuid for convenience
+// Re-export commonly used types
+pub use blockchain::BlockIterator;
 pub use uuid;

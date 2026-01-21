@@ -8,10 +8,14 @@ A generic, lightweight Rust library for creating and managing blockchain blocks 
 - **Persistent storage**: RocksDB-backed blockchain persistence
 - **Type-state pattern**: Compile-time enforcement of read-only vs read-write access
 - **Automatic height management**: Heights assigned automatically for sequential block ordering
+- **Block size limit**: 100MB maximum block size enforced
+- **Auto-validation**: Automatic incremental validation on block insert
+- **Validation cache**: Tracks last validated height for fast incremental validation
+- **Iterator support**: Efficient block traversal with standard Rust iterator
 - **Height-based indexing**: Efficient block lookup by sequential height
 - **Configurable database**: Multiple RocksDB presets (high performance, high durability, read-only)
 - **SHA-512 hashing**: 64-byte cryptographic hashes for block integrity
-- **Chain validation**: Verify parent-child hash relationships
+- **Chain validation**: Full or incremental validation with timestamp and signature checks
 
 ## Installation
 
@@ -41,9 +45,9 @@ Subsequent builds are faster as dependencies are cached.
 use libblockchain::blockchain::open_read_write_chain;
 
 // Create or open a blockchain
-let chain = open_read_write_chain("./my_blockchain".into(), true)?;
+let chain = open_read_write_chain("./my_blockchain".into())?;
 
-// Insert blocks (height auto-assigned)
+// Insert blocks (height auto-assigned, auto-validated, max 100MB)
 chain.put_block(b"Genesis data".to_vec())?;
 chain.put_block(b"Block 1 data".to_vec())?;
 chain.put_block(b"Block 2 data".to_vec())?;
@@ -129,10 +133,36 @@ let ro_chain = open_read_only_chain("./my_blockchain".into())?;
 
 ```rust
 // Heights are assigned automatically (0, 1, 2, ...)
+// Each block is auto-validated incrementally
+// Maximum block size: 100MB
 let height0 = chain.put_block(b"Genesis data".to_vec())?;
 let height1 = chain.put_block(b"Block 1 data".to_vec())?;
 
 println!("Inserted blocks at heights: {}, {}", height0, height1);
+
+// Size limit enforcement
+let large_data = vec![0u8; 101 * 1024 * 1024]; // 101MB
+match chain.put_block(large_data) {
+    Err(e) => println!("Rejected: {}", e), // "Block data exceeds maximum size"
+    Ok(_) => unreachable!(),
+}
+```
+
+### Iterating Over Blocks
+
+```rust
+// Use the iterator for efficient traversal
+for block_result in chain.iter()? {
+    let block = block_result?;
+    println!("Block {}: {} bytes", block.height(), block.block_data().len());
+}
+
+// Iterator methods work too
+let total_size: usize = chain.iter()?
+    .map(|b| b.ok().map(|block| block.block_data().len()).unwrap_or(0))
+    .sum();
+
+println!("Total blockchain size: {} bytes", total_size);
 ```
 
 ### Querying Blocks

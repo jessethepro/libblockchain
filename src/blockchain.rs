@@ -543,6 +543,21 @@ impl BlockChain<ReadWrite> {
         Ok(height)
     }
 
+    pub fn get_signature_by_height(&self, height: u64) -> Result<Vec<u8>> {
+        let signatures_cf = self
+            .mode
+            .db
+            .cf_handle("signatures")
+            .ok_or_else(|| anyhow!("Failed to get signatures column family"))?;
+        let signature = self
+            .mode
+            .db
+            .get_cf(signatures_cf, height.to_le_bytes())
+            .map_err(|e| anyhow!("Failed to get signature by height: {}", e))?
+            .ok_or_else(|| anyhow!("No signature found at height {}", height))?;
+        Ok(signature)
+    }
+
     pub fn delete_last_block(&self) -> Result<Option<u64>> {
         let block_count = self.block_count()?;
         match block_count {

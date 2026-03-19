@@ -3,7 +3,6 @@ use crate::db_model::RocksDbModel;
 use anyhow::{Result, anyhow};
 use openssl::hash::MessageDigest;
 use rocksdb::{IteratorMode, SingleThreaded};
-use std::path::PathBuf;
 
 /// Maximum block size in bytes (100 MB)
 pub const MAX_BLOCK_SIZE: usize = 100 * 1024 * 1024;
@@ -21,8 +20,8 @@ pub struct ReadWrite {
 }
 
 impl BlockChain<ReadOnly> {
-    pub fn open_read_only(db_path: PathBuf) -> Result<Self> {
-        let db = RocksDbModel::read_only(db_path.clone())
+    pub fn open_read_only(db_path: &str) -> Result<Self> {
+        let db = RocksDbModel::read_only(db_path)
             .with_column_family("blocks")
             .with_column_family("signatures")
             .with_column_family("validation_cache")
@@ -413,8 +412,8 @@ impl<'a> ExactSizeIterator for BlockIterator<'a, ReadOnly> {
 }
 
 impl BlockChain<ReadWrite> {
-    pub fn open_read_write(db_path: PathBuf) -> Result<Self> {
-        let db = RocksDbModel::new(db_path.clone())
+    pub fn open_read_write(db_path: &str) -> Result<Self> {
+        let db = RocksDbModel::new(db_path)
             .with_column_family("blocks")
             .with_column_family("signatures")
             .with_column_family("validation_cache")
@@ -915,10 +914,10 @@ impl<'a> ExactSizeIterator for BlockIterator<'a, ReadWrite> {
     }
 }
 
-pub fn open_read_only_chain(path: PathBuf) -> Result<BlockChain<ReadOnly>> {
+pub fn open_read_only_chain(path: &str) -> Result<BlockChain<ReadOnly>> {
     BlockChain::<ReadOnly>::open_read_only(path)
 }
 
-pub fn open_read_write_chain(path: PathBuf) -> Result<BlockChain<ReadWrite>> {
+pub fn open_read_write_chain(path: &str) -> Result<BlockChain<ReadWrite>> {
     BlockChain::<ReadWrite>::open_read_write(path)
 }

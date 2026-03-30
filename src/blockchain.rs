@@ -901,11 +901,6 @@ impl<'a> Iterator for BlockIterator<'a, ReadWrite> {
         self.current_height += 1;
         Some(result)
     }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = (self.max_height - self.current_height) as usize;
-        (remaining, Some(remaining))
-    }
 }
 
 impl<'a> ExactSizeIterator for BlockIterator<'a, ReadWrite> {

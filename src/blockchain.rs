@@ -19,6 +19,94 @@ pub struct ReadWrite {
     db: rocksdb::DBWithThreadMode<SingleThreaded>,
 }
 
+macro_rules! count_blocks {
+    ($state: ty) => {
+        impl BlockChain<$state> {
+            pub fn block_count(&self) -> Result<u64> {
+                let blocks_cf = self
+                    .mode
+                    .db
+                    .cf_handle("blocks")
+                    .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
+                let count = self
+                    .mode
+                    .db
+                    .iterator_cf(blocks_cf, IteratorMode::Start)
+                    .count() as u64;
+                Ok(count)
+            }
+        }
+    };
+}
+
+count_blocks!(ReadOnly);
+count_blocks!(ReadWrite);
+
+macro_rules! get_block_by_height {
+    ($state: ty) => {
+        impl BlockChain<$state> {
+            pub fn get_block_by_height(&self, height: u64) -> Result<Block> {
+                let block = (|| -> Result<Block> {
+                    let blocks_cf = self
+                        .mode
+                        .db
+                        .cf_handle("blocks")
+                        .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
+                    let block_bytes = self
+                        .mode
+                        .db
+                        .get_cf(blocks_cf, height.to_le_bytes())
+                        .map_err(|e| anyhow!("Failed to get block by height: {}", e))?
+                        .ok_or_else(|| anyhow!("No block found at height {}", height))?;
+                    let stored_height = u64::from_le_bytes(
+                        block_bytes
+                            .get(0..BLOCK_HEIGHT_SIZE)
+                            .and_then(|s| s.try_into().ok())
+                            .ok_or_else(|| anyhow!("Failed to read height from stored block"))?,
+                    );
+                    if height != stored_height {
+                        return Err(anyhow!(
+                            "Block height mismatch: expected {}, got {}",
+                            height,
+                            stored_height
+                        ));
+                    }
+                    let block = Block::from_bytes(&block_bytes)?;
+                    Ok(block)
+                })()?;
+                Ok(block)
+            }
+        }
+    };
+}
+
+get_block_by_height!(ReadOnly);
+get_block_by_height!(ReadWrite);
+
+macro_rules! get_signature_by_height {
+    ($state: ty) => {
+        impl BlockChain<$state> {
+            pub fn get_signature_by_height(&self, height: u64) -> Result<Vec<u8>> {
+                let signatures_cf = self
+                    .mode
+                    .db
+                    .cf_handle("signatures")
+                    .ok_or_else(|| anyhow!("Failed to get signatures column family"))?;
+                let signature = self
+                    .mode
+                    .db
+                    .get_cf(signatures_cf, height.to_le_bytes())
+                    .map_err(|e| anyhow!("Failed to get signature by height: {}", e))?
+                    .ok_or_else(|| anyhow!("No signature found at height {}", height))?;
+                Ok(signature)
+            }
+        }
+    };
+}
+
+get_signature_by_height!(ReadOnly);
+get_signature_by_height!(ReadWrite);
+
 impl BlockChain<ReadOnly> {
     pub fn open_read_only(db_path: &str) -> Result<Self> {
         let db = RocksDbModel::read_only(db_path)
@@ -31,66 +119,6 @@ impl BlockChain<ReadOnly> {
             mode: ReadOnly { db },
         })
     }
-    pub fn block_count(&self) -> Result<u64> {
-        let blocks_cf = self
-            .mode
-            .db
-            .cf_handle("blocks")
-            .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
-        let count = self
-            .mode
-            .db
-            .iterator_cf(blocks_cf, IteratorMode::Start)
-            .count() as u64;
-        Ok(count)
-    }
-    pub fn get_block_by_height(&self, height: u64) -> Result<Block> {
-        let block = (|| -> Result<Block> {
-            let blocks_cf = self
-                .mode
-                .db
-                .cf_handle("blocks")
-                .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
-            let block_bytes = self
-                .mode
-                .db
-                .get_cf(blocks_cf, height.to_le_bytes())
-                .map_err(|e| anyhow!("Failed to get block by height: {}", e))?
-                .ok_or_else(|| anyhow!("No block found at height {}", height))?;
-            let stored_height = u64::from_le_bytes(
-                block_bytes
-                    .get(0..BLOCK_HEIGHT_SIZE)
-                    .and_then(|s| s.try_into().ok())
-                    .ok_or_else(|| anyhow!("Failed to read height from stored block"))?,
-            );
-            if height != stored_height {
-                return Err(anyhow!(
-                    "Block height mismatch: expected {}, got {}",
-                    height,
-                    stored_height
-                ));
-            }
-            let block = Block::from_bytes(&block_bytes)?;
-            Ok(block)
-        })()?;
-        Ok(block)
-    }
-
-    pub fn get_signature_by_height(&self, height: u64) -> Result<Vec<u8>> {
-        let signatures_cf = self
-            .mode
-            .db
-            .cf_handle("signatures")
-            .ok_or_else(|| anyhow!("Failed to get signatures column family"))?;
-        let signature = self
-            .mode
-            .db
-            .get_cf(signatures_cf, height.to_le_bytes())
-            .map_err(|e| anyhow!("Failed to get signature by height: {}", e))?
-            .ok_or_else(|| anyhow!("No signature found at height {}", height))?;
-        Ok(signature)
-    }
-
     /// Validate the entire blockchain from genesis to tip
     ///
     /// Performs full validation checking:
@@ -368,47 +396,6 @@ impl BlockChain<ReadOnly> {
         self.validate_incremental()?;
         Ok(())
     }
-
-    /// Returns an iterator over all blocks in the blockchain by height
-    pub fn iter(&self) -> Result<BlockIterator<'_, ReadOnly>> {
-        let count = self.block_count()?;
-        Ok(BlockIterator {
-            blockchain: self,
-            current_height: 0,
-            max_height: count,
-        })
-    }
-}
-
-/// Iterator over blocks in a blockchain
-pub struct BlockIterator<'a, M> {
-    blockchain: &'a BlockChain<M>,
-    current_height: u64,
-    max_height: u64,
-}
-
-impl<'a> Iterator for BlockIterator<'a, ReadOnly> {
-    type Item = Result<Block>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current_height >= self.max_height {
-            return None;
-        }
-        let result = self.blockchain.get_block_by_height(self.current_height);
-        self.current_height += 1;
-        Some(result)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = (self.max_height - self.current_height) as usize;
-        (remaining, Some(remaining))
-    }
-}
-
-impl<'a> ExactSizeIterator for BlockIterator<'a, ReadOnly> {
-    fn len(&self) -> usize {
-        (self.max_height - self.current_height) as usize
-    }
 }
 
 impl BlockChain<ReadWrite> {
@@ -423,53 +410,6 @@ impl BlockChain<ReadWrite> {
             mode: ReadWrite { db },
         })
     }
-
-    pub fn block_count(&self) -> Result<u64> {
-        let blocks_cf = self
-            .mode
-            .db
-            .cf_handle("blocks")
-            .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
-        let count = self
-            .mode
-            .db
-            .iterator_cf(blocks_cf, IteratorMode::Start)
-            .count() as u64;
-        Ok(count)
-    }
-
-    pub fn get_block_by_height(&self, height: u64) -> Result<Block> {
-        let block = (|| -> Result<Block> {
-            let blocks_cf = self
-                .mode
-                .db
-                .cf_handle("blocks")
-                .ok_or_else(|| anyhow!("Failed to get blocks column family"))?;
-            let block_bytes = self
-                .mode
-                .db
-                .get_cf(blocks_cf, height.to_le_bytes())
-                .map_err(|e| anyhow!("Failed to get block by height: {}", e))?
-                .ok_or_else(|| anyhow!("No block found at height {}", height))?;
-            let stored_height = u64::from_le_bytes(
-                block_bytes
-                    .get(0..BLOCK_HEIGHT_SIZE)
-                    .and_then(|s| s.try_into().ok())
-                    .ok_or_else(|| anyhow!("Failed to read height from stored block"))?,
-            );
-            if height != stored_height {
-                return Err(anyhow!(
-                    "Block height mismatch: expected {}, got {}",
-                    height,
-                    stored_height
-                ));
-            }
-            let block = Block::from_bytes(&block_bytes)?;
-            Ok(block)
-        })()?;
-        Ok(block)
-    }
-
     pub fn put_block(&self, block_data: Vec<u8>) -> Result<u64> {
         // Check block size limit
         if block_data.len() > MAX_BLOCK_SIZE {
@@ -540,21 +480,6 @@ impl BlockChain<ReadWrite> {
             .put_cf(signatures_cf, height.to_le_bytes(), &signature)
             .map_err(|e| anyhow!("Failed to insert signature: {}", e))?;
         Ok(height)
-    }
-
-    pub fn get_signature_by_height(&self, height: u64) -> Result<Vec<u8>> {
-        let signatures_cf = self
-            .mode
-            .db
-            .cf_handle("signatures")
-            .ok_or_else(|| anyhow!("Failed to get signatures column family"))?;
-        let signature = self
-            .mode
-            .db
-            .get_cf(signatures_cf, height.to_le_bytes())
-            .map_err(|e| anyhow!("Failed to get signature by height: {}", e))?
-            .ok_or_else(|| anyhow!("No signature found at height {}", height))?;
-        Ok(signature)
     }
 
     pub fn delete_last_block(&self) -> Result<Option<u64>> {
@@ -877,35 +802,6 @@ impl BlockChain<ReadWrite> {
     pub fn validate(&self) -> Result<()> {
         self.validate_incremental()?;
         Ok(())
-    }
-
-    /// Returns an iterator over all blocks in the blockchain by height
-    pub fn iter(&self) -> Result<BlockIterator<'_, ReadWrite>> {
-        let count = self.block_count()?;
-        Ok(BlockIterator {
-            blockchain: self,
-            current_height: 0,
-            max_height: count,
-        })
-    }
-}
-
-impl<'a> Iterator for BlockIterator<'a, ReadWrite> {
-    type Item = Result<Block>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current_height >= self.max_height {
-            return None;
-        }
-        let result = self.blockchain.get_block_by_height(self.current_height);
-        self.current_height += 1;
-        Some(result)
-    }
-}
-
-impl<'a> ExactSizeIterator for BlockIterator<'a, ReadWrite> {
-    fn len(&self) -> usize {
-        (self.max_height - self.current_height) as usize
     }
 }
 

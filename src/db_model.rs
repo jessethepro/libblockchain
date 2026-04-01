@@ -29,7 +29,8 @@
 //!     .with_block_cache_size_mb(1024) // 1 GB cache
 //!     .with_compression(CompressionType::Zstd)
 //!     .with_column_family("blocks")
-//!     .with_column_family("height")
+//!     .with_column_family("signatures")
+//!     .with_column_family("validation_cache")
 //!     .open()?;
 //! # Ok(())
 //! # }
@@ -191,10 +192,12 @@ impl Default for RocksDbModel {
             column_families: vec![
                 // Default column family (required)
                 "default".to_string(),
-                // Block storage: key = UUID, value = Block
+                // Block storage: key = u64 height, value = serialized Block
                 "blocks".to_string(),
-                // Height index: key = u64 height, value = UUID
-                "height".to_string(),
+                // Signature storage: key = u64 height, value = signature bytes
+                "signatures".to_string(),
+                // Validation cache: stores metadata like last validated height
+                "validation_cache".to_string(),
             ],
             read_only: false,
             enable_statistics: false,
@@ -327,9 +330,10 @@ impl RocksDbModel {
         }
 
         if self.optimize_for_point_lookup
-            && let Some(cache_size) = self.block_cache_size {
-                opts.optimize_for_point_lookup(cache_size as u64);
-            }
+            && let Some(cache_size) = self.block_cache_size
+        {
+            opts.optimize_for_point_lookup(cache_size as u64);
+        }
 
         // Open database with column families
         if self.read_only {
@@ -340,6 +344,103 @@ impl RocksDbModel {
             // Enable automatic creation of missing column families
             opts.create_missing_column_families(true);
             rocksdb::DB::open_cf(&opts, &self.path, &self.column_families)
+        }
+    }
+
+    /// Open a RocksDB database using the thread-safe wrapper.
+    pub fn open_multi_threaded(
+        &self,
+    ) -> Result<rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>, rocksdb::Error> {
+        let mut opts = rocksdb::Options::default();
+
+        // Basic options
+        opts.create_if_missing(self.create_if_missing);
+        opts.set_error_if_exists(self.error_if_exists);
+
+        // Cache configuration
+        if let Some(cache_size) = self.block_cache_size {
+            let cache = rocksdb::Cache::new_lru_cache(cache_size);
+            let mut block_opts = rocksdb::BlockBasedOptions::default();
+            block_opts.set_block_cache(&cache);
+            opts.set_block_based_table_factory(&block_opts);
+        }
+
+        if let Some(buffer_size) = self.write_buffer_size {
+            opts.set_write_buffer_size(buffer_size);
+        }
+
+        if let Some(num_buffers) = self.max_write_buffer_number {
+            opts.set_max_write_buffer_number(num_buffers);
+        }
+
+        // Compression
+        opts.set_compression_type(match self.compression_type {
+            CompressionType::None => rocksdb::DBCompressionType::None,
+            CompressionType::Snappy => rocksdb::DBCompressionType::Snappy,
+            CompressionType::Zlib => rocksdb::DBCompressionType::Zlib,
+            CompressionType::Bz2 => rocksdb::DBCompressionType::Bz2,
+            CompressionType::Lz4 => rocksdb::DBCompressionType::Lz4,
+            CompressionType::Lz4hc => rocksdb::DBCompressionType::Lz4hc,
+            CompressionType::Zstd => rocksdb::DBCompressionType::Zstd,
+        });
+
+        if let Some(bottommost) = self.bottommost_compression_type {
+            opts.set_bottommost_compression_type(match bottommost {
+                CompressionType::None => rocksdb::DBCompressionType::None,
+                CompressionType::Snappy => rocksdb::DBCompressionType::Snappy,
+                CompressionType::Zlib => rocksdb::DBCompressionType::Zlib,
+                CompressionType::Bz2 => rocksdb::DBCompressionType::Bz2,
+                CompressionType::Lz4 => rocksdb::DBCompressionType::Lz4,
+                CompressionType::Lz4hc => rocksdb::DBCompressionType::Lz4hc,
+                CompressionType::Zstd => rocksdb::DBCompressionType::Zstd,
+            });
+        }
+
+        // Performance
+        if let Some(jobs) = self.max_background_jobs {
+            opts.set_max_background_jobs(jobs);
+        }
+
+        if let Some(files) = self.max_open_files {
+            opts.set_max_open_files(files);
+        }
+
+        opts.set_use_direct_reads(self.use_direct_reads);
+        opts.set_use_direct_io_for_flush_and_compaction(
+            self.use_direct_io_for_flush_and_compaction,
+        );
+
+        // Durability
+        if self.disable_wal {
+            opts.set_wal_dir(&self.path);
+        }
+
+        if self.enable_statistics {
+            opts.enable_statistics();
+        }
+
+        if self.optimize_for_point_lookup
+            && let Some(cache_size) = self.block_cache_size
+        {
+            opts.optimize_for_point_lookup(cache_size as u64);
+        }
+
+        if self.read_only {
+            rocksdb::DBWithThreadMode::<rocksdb::MultiThreaded>::open_cf_for_read_only(
+                &opts,
+                &self.path,
+                &self.column_families,
+                false,
+            )
+        } else if self.column_families.is_empty() {
+            rocksdb::DBWithThreadMode::<rocksdb::MultiThreaded>::open(&opts, &self.path)
+        } else {
+            opts.create_missing_column_families(true);
+            rocksdb::DBWithThreadMode::<rocksdb::MultiThreaded>::open_cf(
+                &opts,
+                &self.path,
+                &self.column_families,
+            )
         }
     }
 

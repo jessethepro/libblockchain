@@ -2,18 +2,19 @@
 
 A generic, lightweight Rust library for creating and managing blockchain blocks with persistent RocksDB storage. This library provides core block structures and database-backed persistence while remaining agnostic to the actual data you store in blocks.
 
+Current API note: the blockchain layer exposes a single shared read/write handle. Open it with `open_chain()` or `BlockChain::open(...)`, and clone the handle to share it across threads.
+
 ## Features
 
 - **Data-agnostic**: Store any application-specific data in blocks (JSON, binary, custom formats)
 - **Persistent storage**: RocksDB-backed blockchain persistence
-- **Type-state pattern**: Compile-time enforcement of read-only vs read-write access
 - **Automatic height management**: Heights assigned automatically for sequential block ordering
 - **Block size limit**: 100MB maximum block size enforced
 - **Auto-validation**: Automatic incremental validation on block insert
 - **Validation cache**: Tracks last validated height for fast incremental validation
-- **Iterator support**: Efficient block traversal with standard Rust iterator
 - **Height-based indexing**: Efficient block lookup by sequential height
-- **Configurable database**: Multiple RocksDB presets (high performance, high durability, read-only)
+- **Thread-shareable handle**: Clone a single open blockchain handle and use it across threads
+- **Configurable database**: Multiple RocksDB presets for raw database access
 - **SHA-512 hashing**: 64-byte cryptographic hashes for block integrity
 - **Chain validation**: Full or incremental validation with timestamp and signature checks
 
@@ -42,30 +43,38 @@ Subsequent builds are faster as dependencies are cached.
 ## Quick Start
 
 ```rust
-use libblockchain::blockchain::open_read_write_chain;
+use anyhow::Result;
+use libblockchain::blockchain::open_chain;
 
-// Create or open a blockchain
-let chain = open_read_write_chain("./my_blockchain".into())?;
+fn main() -> Result<()> {
+    // Create or open a blockchain
+    let chain = open_chain("./my_blockchain")?;
 
-// Insert blocks (height auto-assigned, auto-validated, max 100MB)
-chain.put_block(b"Genesis data".to_vec())?;
-chain.put_block(b"Block 1 data".to_vec())?;
-chain.put_block(b"Block 2 data".to_vec())?;
+    // Insert blocks (height auto-assigned, auto-validated, max 100MB)
+    chain.put_block(b"Genesis data".to_vec(), b"sig0".to_vec())?;
+    chain.put_block(b"Block 1 data".to_vec(), b"sig1".to_vec())?;
+    chain.put_block(b"Block 2 data".to_vec(), b"sig2".to_vec())?;
 
-// Query blocks
-let genesis = chain.get_block_by_height(0)?;
-println!("Genesis data: {:?}", genesis.block_data());
+    // Query blocks
+    let (genesis, signature) = chain.get_block_by_height(0);
+    let genesis = genesis?;
+    let signature = signature?;
+    println!("Genesis data: {:?}", genesis.block_data());
+    println!("Genesis signature: {:?}", signature);
 
-// Get latest block
-let count = chain.block_count()?;
-if count > 0 {
-    let latest = chain.get_block_by_height(count - 1)?;
-    println!("Latest block data: {:?}", latest.block_data());
+    // Get latest block
+    let count = chain.block_count()?;
+    if count > 0 {
+        let (latest, _) = chain.get_block_by_height(count - 1);
+        println!("Latest block data: {:?}", latest?.block_data());
+    }
+
+    // Validate entire blockchain integrity
+    chain.validate()?;
+    println!("Blockchain has {} blocks and is valid!", count);
+
+    Ok(())
 }
-
-// Validate entire blockchain integrity
-chain.validate()?;
-println!("Blockchain has {} blocks and is valid!", count);
 ```
 
 ## Architecture
@@ -78,10 +87,10 @@ println!("Blockchain has {} blocks and is valid!", count);
 - Height stored in header, assigned on insertion by counting existing blocks
 
 **Blockchain Storage** ([src/blockchain.rs](src/blockchain.rs)):
-- **Type-state pattern**: `OpenChain`, `ReadOnly`, `ReadWrite` for compile-time safety
-- Two RocksDB column families: `blocks` and `signatures`
-- Database is `DBWithThreadMode<SingleThreaded>` (not thread-safe)
-- Helper functions: `open_read_only_chain()`, `open_read_write_chain()`
+- Single blockchain type: `BlockChain`
+- Three RocksDB column families: `blocks`, `signatures`, and `validation_cache`
+- Database is `DBWithThreadMode<MultiThreaded>` wrapped in `Arc` for shared ownership
+- Helper function: `open_chain()`
 
 **Database Configuration** ([src/db_model.rs](src/db_model.rs)):
 - Presets: `high_performance()`, `high_durability()`, `read_only()`
@@ -94,21 +103,24 @@ The blockchain uses two RocksDB column families:
 - **`blocks`**: Maps block height (u64) → Block data
 - **`signatures`**: Maps block height (u64) → signature bytes
 
-### Type-State Pattern
+### Shared Handle Model
 
-Compile-time enforcement prevents calling write methods on read-only chains:
+The blockchain API exposes a single cloneable read/write handle:
 
 ```rust
-use libblockchain::blockchain::{BlockChain, ReadOnly, ReadWrite};
+use libblockchain::blockchain::{BlockChain, open_chain};
+use std::thread;
 
-// Read-only access
-let ro_chain = BlockChain::<ReadOnly>::open_read_only(...)?;
-let block = ro_chain.get_block_by_height(0)?;  // OK
-// ro_chain.put_block(data)?;  // Compile error!
+let chain = open_chain("./my_blockchain")?;
+let cloned = chain.clone();
 
-// Read-write access
-let rw_chain = BlockChain::<ReadWrite>::open_read_write(...)?;
-rw_chain.put_block(data)?;  // OK
+thread::spawn(move || {
+    cloned.put_block(b"hello".to_vec(), b"sig".to_vec())
+})
+.join()
+.expect("worker thread panicked")?;
+
+let _: BlockChain = chain;
 ```
 
 ## Usage Examples
@@ -116,17 +128,13 @@ rw_chain.put_block(data)?;  // OK
 ### Opening a Blockchain
 
 ```rust
-use libblockchain::blockchain::{BlockChain, OpenChain, open_read_write_chain, open_read_only_chain};
+use libblockchain::blockchain::{BlockChain, open_chain};
 
-// Method 1: Using helper functions (recommended)
-let chain = open_read_write_chain("./my_blockchain".into(), true)?;
+// Method 1: Helper function
+let chain = open_chain("./my_blockchain")?;
 
-// Method 2: Type-state pattern (more control)
-let open_chain = BlockChain::<OpenChain>::open_or_create("./my_blockchain".into())?;
-let rw_chain = BlockChain::<ReadWrite>::open_read_write(open_chain)?;
-
-// Read-only access
-let ro_chain = open_read_only_chain("./my_blockchain".into())?;
+// Method 2: Direct constructor
+let chain = BlockChain::open("./my_blockchain")?;
 ```
 
 ### Inserting Blocks
@@ -135,63 +143,41 @@ let ro_chain = open_read_only_chain("./my_blockchain".into())?;
 // Heights are assigned automatically (0, 1, 2, ...)
 // Each block is auto-validated incrementally
 // Maximum block size: 100MB
-let height0 = chain.put_block(b"Genesis data".to_vec())?;
-let height1 = chain.put_block(b"Block 1 data".to_vec())?;
+let height0 = chain.put_block(b"Genesis data".to_vec(), b"sig0".to_vec())?;
+let height1 = chain.put_block(b"Block 1 data".to_vec(), b"sig1".to_vec())?;
 
 println!("Inserted blocks at heights: {}, {}", height0, height1);
 
 // Size limit enforcement
 let large_data = vec![0u8; 101 * 1024 * 1024]; // 101MB
-match chain.put_block(large_data) {
+match chain.put_block(large_data, b"sig-large".to_vec()) {
     Err(e) => println!("Rejected: {}", e), // "Block data exceeds maximum size"
     Ok(_) => unreachable!(),
 }
-```
-
-### Iterating Over Blocks
-
-```rust
-// Use the iterator for efficient traversal
-for block_result in chain.iter()? {
-    let block = block_result?;
-    println!("Block {}: {} bytes", block.height(), block.block_data().len());
-}
-
-// Iterator methods work too
-let total_size: usize = chain.iter()?
-    .map(|b| b.ok().map(|block| block.block_data().len()).unwrap_or(0))
-    .sum();
-
-println!("Total blockchain size: {} bytes", total_size);
 ```
 
 ### Querying Blocks
 
 ```rust
 // By height
-let block = chain.get_block_by_height(5)?;
+let (block, signature) = chain.get_block_by_height(5);
+let block = block?;
+let signature = signature?;
 
 // Access block fields
 println!("Height: {}", block.height());
 println!("Hash: {:?}", block.block_hash());
 println!("Parent: {:?}", block.parent_hash());
 println!("Data: {:?}", block.block_data());
+println!("Signature: {:?}", signature);
 
 // Get latest block
 let count = chain.block_count()?;
 if count > 0 {
-    let latest = chain.get_block_by_height(count - 1)?;
-}
-```
-
-### Iterating Over Blocks
-
-```rust
-// Manual iteration by height
-let count = chain.block_count()?;
-for height in 0..count {
-    let block = chain.get_block_by_height(height)?;
-    println!("Block {}: {:?}", height, block.block_hash());
+    let (latest, latest_signature) = chain.get_block_by_height(count - 1);
+    let latest = latest?;
+    let latest_signature = latest_signature?;
+    println!("Latest block: {} with signature {:?}", latest.height(), latest_signature);
 }
 ```
 
@@ -215,11 +201,12 @@ let tx = Transaction {
 
 // Serialize and insert
 let data = serde_json::to_vec(&tx)?;
-chain.put_block(data)?;
+chain.put_block(data, b"tx-signature".to_vec())?;
 
 // Later, retrieve and deserialize
 let count = chain.block_count()?;
-let block = chain.get_block_by_height(count - 1)?;
+let (block, _) = chain.get_block_by_height(count - 1);
+let block = block?;
 let retrieved_tx: Transaction = serde_json::from_slice(&block.block_data())?;
 ```
 
@@ -260,26 +247,23 @@ println!("Blockchain is valid!");
 
 ## API Reference
 
-### `BlockChain<Mode>`
+### `BlockChain`
 
 **Opening:**
-- `BlockChain::<OpenChain>::open(path) -> Result<Self>`: Open existing blockchain
-- `BlockChain::<OpenChain>::open_or_create(path) -> Result<Self>`: Create if missing
-- `BlockChain::<ReadOnly>::open_read_only(OpenChain) -> Result<Self>`: Convert to read-only
-- `BlockChain::<ReadWrite>::open_read_write(OpenChain) -> Result<Self>`: Convert to read-write
+- `BlockChain::open(path) -> Result<Self>`: Open or create a blockchain
 
 **Helper Functions:**
-- `open_read_only_chain(path) -> Result<BlockChain<ReadOnly>>`
-- `open_read_write_chain(path, create: bool) -> Result<BlockChain<ReadWrite>>`
+- `open_chain(path) -> Result<BlockChain>`
 
-**ReadOnly Operations:**
+**Operations:**
 - `block_count() -> Result<u64>`: Total blocks in chain
-- `get_block_by_height(height: u64) -> Result<Block>`: Retrieve block by height
+- `get_block_by_height(height: u64) -> (Result<Block>, Result<Vec<u8>>)`:
+    Retrieve block and signature by height
 - `get_signature_by_height(height: u64) -> Result<Vec<u8>>`: Retrieve signature
-- `validate() -> Result<()>`: Verify entire chain integrity
-
-**ReadWrite Operations (in addition to ReadOnly):**
-- `put_block(data: Vec<u8>) -> Result<u64>`: Insert block, returns height
+- `validate() -> Result<()>`: Verify chain integrity incrementally
+- `validate_full() -> Result<()>`: Full validation from genesis to tip
+- `validate_incremental() -> Result<u64>`: Validate blocks since the cached height
+- `put_block(data: Vec<u8>, signature: Vec<u8>) -> Result<u64>`: Insert block and signature, returns height
 - `put_signature(height: u64, sig: Vec<u8>) -> Result<u64>`: Store signature
 - `delete_last_block() -> Result<Option<u64>>`: Delete most recent block
 
@@ -348,17 +332,27 @@ Serialization: 100 bytes = height(8) + uid(16) + version(4) + parent_hash(64) + 
 
 ## Thread Safety
 
-⚠️ **Single-Threaded**: The database is `DBWithThreadMode<SingleThreaded>` and **cannot be shared across threads**.
+The blockchain handle is thread-shareable.
 
-To use in multi-threaded applications, you would need to:
-1. Change to `MultiThreaded` mode in the code
-2. Add proper `Send`/`Sync` trait implementations
-3. Handle concurrent access carefully
+- `BlockChain` stores `Arc<DBWithThreadMode<MultiThreaded>>`
+- `BlockChain` implements `Clone`
+- A cloned handle can be moved to another thread and used there
+
+```rust
+use std::thread;
+use libblockchain::blockchain::open_chain;
+
+let chain = open_chain("./my_blockchain")?;
+let worker = chain.clone();
+
+thread::spawn(move || worker.put_block(b"threaded".to_vec(), b"sig".to_vec()))
+    .join()
+    .expect("worker panicked")?;
+```
 
 ## Performance Tips
 
 **Read Performance:**
-- Use read-only mode when not modifying: `open_read_only_chain()`
 - Adjust block cache size: `RocksDbModel::new(path).with_block_cache_size_mb(2048)`
 - Sequential reads by height are efficient
 
@@ -391,7 +385,7 @@ This is a foundational library designed to be extended by applications. It does 
 ```bash
 cargo check    # Fast type checking
 cargo build    # Full build (first time: 5-10 min)
-cargo test     # Run tests (currently empty)
+cargo test     # Run tests
 cargo clippy   # Lint checking
 cargo doc --open  # View documentation
 ```

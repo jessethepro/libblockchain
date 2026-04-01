@@ -2,10 +2,10 @@
 //!
 //! This module defines the core block data structures used in the blockchain:
 //! - `BlockHeader`: Contains cryptographically-relevant metadata (height, UUID, version, parent hash, timestamp)
-//! - `Block`: Complete block with header, hash, and encrypted application data
+//! - `Block`: Complete block with header, hash, and opaque application data
 //!
 //! Blocks are linked through parent hashes to form an immutable chain. Each block's
-//! hash is computed from its header using SHA-512.
+//! hash is computed from its header bytes and payload using SHA-512.
 
 pub const BLOCK_HEIGHT_SIZE: usize = 8; // u64 size in bytes
 pub const BLOCK_VERSION: u32 = 1;
@@ -163,22 +163,17 @@ impl BlockHeader {
     }
 }
 
-/// Complete block with header, hash, and application data
+/// Complete block with header, hash, and application data.
 ///
 /// Blocks are the fundamental unit of the blockchain. Each block contains:
 /// - A header with cryptographic metadata
-/// - A SHA-512 hash computed from the header
-/// - Application-specific data (only this field is encrypted in storage)
+/// - A SHA-512 hash computed from the header bytes and payload
+/// - Application-specific data stored as raw bytes
 ///
 /// # Serialization Format
 ///
 /// ```text
 /// header(100) || block_hash(64) || data_len(4) || block_data(variable)
-/// ```
-///
-/// Note: When stored in the database, `block_data` is replaced with encrypted data:
-/// ```text
-/// header(100) || block_hash(64) || [aes_key_len(4) || RSA-OAEP(aes_key)(var) || nonce(12) || tag(16) || data_len(4) || AES-GCM(data)(var)]
 /// ```
 #[derive(Debug, Clone)]
 pub struct Block {
@@ -188,10 +183,7 @@ pub struct Block {
     /// SHA-512 hash of the block header (64 bytes)
     block_hash: [u8; 64],
 
-    /// Application-specific data (opaque to this library)
-    ///
-    /// In memory: plaintext application data
-    /// In database: hybrid encrypted format requiring application's private key to decrypt
+    /// Application-specific payload bytes.
     block_data: Vec<u8>,
 }
 
@@ -201,7 +193,7 @@ impl Block {
     /// # Arguments
     /// * `height` - Block height in chain (must be > 0)
     /// * `parent_hash` - SHA-512 hash of the parent block
-    /// * `block_data` - Application-specific data (will be encrypted when stored)
+    /// * `block_data` - Application-specific payload bytes
     pub fn new_regular_block(
         height: u64,
         parent_hash: Vec<u8>,

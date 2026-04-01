@@ -45,7 +45,7 @@ count_blocks!(ReadWrite);
 macro_rules! get_block_by_height {
     ($state: ty) => {
         impl BlockChain<$state> {
-            pub fn get_block_by_height(&self, height: u64) -> Result<Block> {
+            pub fn get_block_by_height(&self, height: u64) -> (Result<Block>, Result<Vec<u8>>) {
                 let block = (|| -> Result<Block> {
                     let blocks_cf = self
                         .mode
@@ -73,8 +73,24 @@ macro_rules! get_block_by_height {
                     }
                     let block = Block::from_bytes(&block_bytes)?;
                     Ok(block)
-                })()?;
-                Ok(block)
+                })();
+                let signature = || -> Result<Vec<u8>> {
+                    let signatures_cf = self
+                        .mode
+                        .db
+                        .cf_handle("signatures")
+                        .ok_or_else(|| anyhow!("Failed to get signatures column family"))?;
+                    match self
+                        .mode
+                        .db
+                        .get_cf(signatures_cf, height.to_le_bytes())
+                        .map_err(|e| anyhow!("Failed to get signature by height: {}", e))?
+                    {
+                        Some(sig) => Ok(sig),
+                        None => Ok(vec![]), // No signature found, return empty vector
+                    }
+                }();
+                (block, signature)
             }
         }
     };
@@ -107,6 +123,292 @@ macro_rules! get_signature_by_height {
 get_signature_by_height!(ReadOnly);
 get_signature_by_height!(ReadWrite);
 
+macro_rules! validation_funcs {
+    ($state: ty) => {
+        impl BlockChain<$state> {
+            /// Validate the entire blockchain from genesis to tip
+            ///
+            /// Performs full validation checking:
+            /// - Parent hash chain integrity
+            /// - Block hash correctness
+            /// - Height gaps
+            /// - Timestamp consistency
+            /// - Signature presence (if stored)
+            ///
+            /// This is an expensive O(n) operation. Consider using `validate_incremental()` instead.
+            pub fn validate_full(&self) -> Result<()> {
+                let block_count = self.block_count()?;
+                if block_count == 0 {
+                    return Ok(()); // Empty chain is valid
+                }
+
+                // Check for height gaps by attempting to retrieve all blocks sequentially
+                for i in 0..block_count {
+                    let (block, signature) = match self.get_block_by_height(i) {
+                        (Ok(block), Ok(signature)) => (block, signature),
+                        (Err(e), _) | (_, Err(e)) => {
+                            return Err(anyhow!(
+                                "Height gap detected: block at height {} is missing or corrupted: {}",
+                                i,
+                                e
+                            ));
+                        }
+                    };
+
+                    let expected_height = i;
+                    if block.height() != expected_height {
+                        return Err(anyhow!(
+                            "Block height mismatch at index {}: expected {}, got {}",
+                            i,
+                            expected_height,
+                            block.height()
+                        ));
+                    }
+
+                    // Validate genesis block
+                    if expected_height == 0 {
+                        if block.parent_hash() != [0u8; BLOCK_HASH_SIZE] {
+                            return Err(anyhow!("Genesis block has non-zero parent hash"));
+                        }
+                        // Genesis block timestamp should be reasonable (not in far future)
+                        let now = std::time::SystemTime::now();
+                        let future_threshold = now + std::time::Duration::from_secs(3600); // 1 hour tolerance
+                        if block.timestamp() > future_threshold {
+                            return Err(anyhow!("Genesis block timestamp is too far in the future"));
+                        }
+                    } else {
+                        // Validate parent linkage
+                        let parent_block = match self.get_block_by_height(expected_height - 1) {
+                            (Ok(block), Ok(_)) => block,
+                            (Err(e), _) | (_, Err(e)) => {
+                                return Err(anyhow!(
+                                    "Failed to retrieve parent block at height {}: {}",
+                                    expected_height - 1,
+                                    e
+                                ));
+                            }
+                        };
+                        if block.parent_hash() != parent_block.block_hash() {
+                            return Err(anyhow!(
+                                "Block at height {} has invalid parent hash",
+                                expected_height
+                            ));
+                        }
+
+                        // Validate timestamp progression - block timestamp must be >= parent timestamp
+                        if block.timestamp() < parent_block.timestamp() {
+                            return Err(anyhow!(
+                                "Block at height {} has timestamp before parent block (block: {:?}, parent: {:?})",
+                                expected_height,
+                                block.timestamp(),
+                                parent_block.timestamp()
+                            ));
+                        }
+
+                        // Validate timestamp is not too far in the future
+                        let now = std::time::SystemTime::now();
+                        let future_threshold = now + std::time::Duration::from_secs(3600); // 1 hour tolerance
+                        if block.timestamp() > future_threshold {
+                            return Err(anyhow!(
+                                "Block at height {} has timestamp too far in the future",
+                                expected_height
+                            ));
+                        }
+                    }
+
+                    // Validate block hash
+                    let computed_hash = (|| -> Result<openssl::hash::DigestBytes> {
+                        let mut hashing_bytes = block.header_bytes();
+                        hashing_bytes.extend_from_slice(&block.block_data());
+                        Ok(openssl::hash::hash(
+                            MessageDigest::sha512(),
+                            &hashing_bytes,
+                        )?)
+                    })()?;
+                    if computed_hash.as_ref() != block.block_hash() {
+                        return Err(anyhow!(
+                            "Block at height {} has invalid hash",
+                            expected_height
+                        ));
+                    }
+
+                    // Validate signature if present
+                    if signature.is_empty() {
+                        return Err(anyhow!(
+                            "Block at height {} has empty signature",
+                            expected_height
+                        ));
+                        // Note: Actual cryptographic signature verification requires
+                        // application-specific public key. Here we only verify presence.
+                        // Applications should provide their own signature verification
+                        // using the stored signature and their public key infrastructure.
+                    }
+                }
+                Ok(())
+            }
+
+            /// Validate only blocks added since last validation (incremental)
+            ///
+            /// Uses a validation cache to track the last validated height.
+            /// Only validates blocks from (last_validated_height + 1) to current tip.
+            /// Much faster than `validate_full()` for chains that grow over time.
+            ///
+            /// Returns the height up to which validation succeeded.
+            pub fn validate_incremental(&self) -> Result<u64> {
+                let block_count = self.block_count()?;
+                if block_count == 0 {
+                    return Ok(0); // Empty chain, nothing to validate
+                }
+
+                // Get last validated height from cache
+                let validation_cache_cf = self
+                    .mode
+                    .db
+                    .cf_handle("validation_cache")
+                    .ok_or_else(|| anyhow!("Failed to get validation_cache column family"))?;
+
+                let last_validated = self
+                    .mode
+                    .db
+                    .get_cf(validation_cache_cf, b"last_validated_height")
+                    .map_err(|e| anyhow!("Failed to read validation cache: {}", e))?
+                    .and_then(|bytes| {
+                        if bytes.len() == 8 {
+                            Some(u64::from_le_bytes(bytes.try_into().ok()?))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+
+                // If already fully validated, nothing to do
+                if last_validated >= block_count - 1 {
+                    return Ok(last_validated);
+                }
+
+                // Validate from (last_validated + 1) to (block_count - 1)
+                let start_height = if last_validated == 0 {
+                    0
+                } else {
+                    last_validated + 1
+                };
+
+                for i in start_height..block_count {
+                    let (block, signature) = match self.get_block_by_height(i) {
+                        (Ok(block), Ok(signature)) => (block, signature),
+                        (Err(e), _) | (_, Err(e)) => {
+                            return Err(anyhow!(
+                                "Height gap detected: block at height {} is missing or corrupted: {}",
+                                i,
+                                e
+                            ));
+                        }
+                    };
+
+                    let expected_height = i;
+                    if block.height() != expected_height {
+                        return Err(anyhow!(
+                            "Block height mismatch at index {}: expected {}, got {}",
+                            i,
+                            expected_height,
+                            block.height()
+                        ));
+                    }
+
+                    // Validate genesis block
+                    if expected_height == 0 {
+                        if block.parent_hash() != [0u8; BLOCK_HASH_SIZE] {
+                            return Err(anyhow!("Genesis block has non-zero parent hash"));
+                        }
+                        let now = std::time::SystemTime::now();
+                        let future_threshold = now + std::time::Duration::from_secs(3600);
+                        if block.timestamp() > future_threshold {
+                            return Err(anyhow!("Genesis block timestamp is too far in the future"));
+                        }
+                    } else {
+                        // Validate parent linkage
+                        let parent_block = match self.get_block_by_height(expected_height - 1) {
+                            (Ok(block), Ok(_)) => block,
+                            (Err(e), _) | (_, Err(e)) => {
+                                return Err(anyhow!(
+                                    "Height gap detected: block at height {} is missing or corrupted: {}",
+                                    expected_height - 1,
+                                    e
+                                ));
+                            }
+                        };
+                        if block.parent_hash() != parent_block.block_hash() {
+                            return Err(anyhow!(
+                                "Block at height {} has invalid parent hash",
+                                expected_height
+                            ));
+                        }
+
+                        // Validate timestamp progression
+                        if block.timestamp() < parent_block.timestamp() {
+                            return Err(anyhow!(
+                                "Block at height {} has timestamp before parent block (block: {:?}, parent: {:?})",
+                                expected_height,
+                                block.timestamp(),
+                                parent_block.timestamp()
+                            ));
+                        }
+
+                        let now = std::time::SystemTime::now();
+                        let future_threshold = now + std::time::Duration::from_secs(3600);
+                        if block.timestamp() > future_threshold {
+                            return Err(anyhow!(
+                                "Block at height {} has timestamp too far in the future",
+                                expected_height
+                            ));
+                        }
+                    }
+
+                    // Validate block hash
+                    let computed_hash = (|| -> Result<openssl::hash::DigestBytes> {
+                        let mut hashing_bytes = block.header_bytes();
+                        hashing_bytes.extend_from_slice(&block.block_data());
+                        Ok(openssl::hash::hash(
+                            MessageDigest::sha512(),
+                            &hashing_bytes,
+                        )?)
+                    })()?;
+                    if computed_hash.as_ref() != block.block_hash() {
+                        return Err(anyhow!(
+                            "Block at height {} has invalid hash",
+                            expected_height
+                        ));
+                    }
+
+                    // Validate signature if present
+                    if signature.is_empty() {
+                        return Err(anyhow!(
+                            "Block at height {} has empty signature",
+                            expected_height
+                        ));
+                    }
+                }
+
+                // Update validation cache with new height (read-only can't write, so skip)
+                // Note: This is read-only mode, cache update happens in ReadWrite mode
+                Ok(block_count - 1)
+            }
+
+            /// Convenience method that calls validate_incremental()
+            ///
+            /// For backward compatibility. Use `validate_full()` for complete validation
+            /// or `validate_incremental()` for faster incremental validation.
+            pub fn validate(&self) -> Result<()> {
+                self.validate_incremental()?;
+                Ok(())
+            }
+        }
+    };
+}
+
+validation_funcs!(ReadOnly);
+validation_funcs!(ReadWrite);
+
 impl BlockChain<ReadOnly> {
     pub fn open_read_only(db_path: &str) -> Result<Self> {
         let db = RocksDbModel::read_only(db_path)
@@ -118,283 +420,6 @@ impl BlockChain<ReadOnly> {
         Ok(Self {
             mode: ReadOnly { db },
         })
-    }
-    /// Validate the entire blockchain from genesis to tip
-    ///
-    /// Performs full validation checking:
-    /// - Parent hash chain integrity
-    /// - Block hash correctness
-    /// - Height gaps
-    /// - Timestamp consistency
-    /// - Signature presence (if stored)
-    ///
-    /// This is an expensive O(n) operation. Consider using `validate_incremental()` instead.
-    pub fn validate_full(&self) -> Result<()> {
-        let block_count = self.block_count()?;
-        if block_count == 0 {
-            return Ok(()); // Empty chain is valid
-        }
-
-        // Check for height gaps by attempting to retrieve all blocks sequentially
-        for i in 0..block_count {
-            let block = self.get_block_by_height(i).map_err(|e| {
-                anyhow!(
-                    "Height gap detected: block at height {} is missing or corrupted: {}",
-                    i,
-                    e
-                )
-            })?;
-
-            let expected_height = i;
-            if block.height() != expected_height {
-                return Err(anyhow!(
-                    "Block height mismatch at index {}: expected {}, got {}",
-                    i,
-                    expected_height,
-                    block.height()
-                ));
-            }
-
-            // Validate genesis block
-            if expected_height == 0 {
-                if block.parent_hash() != [0u8; BLOCK_HASH_SIZE] {
-                    return Err(anyhow!("Genesis block has non-zero parent hash"));
-                }
-                // Genesis block timestamp should be reasonable (not in far future)
-                let now = std::time::SystemTime::now();
-                let future_threshold = now + std::time::Duration::from_secs(3600); // 1 hour tolerance
-                if block.timestamp() > future_threshold {
-                    return Err(anyhow!("Genesis block timestamp is too far in the future"));
-                }
-            } else {
-                // Validate parent linkage
-                let parent_block = self.get_block_by_height(expected_height - 1)?;
-                if block.parent_hash() != parent_block.block_hash() {
-                    return Err(anyhow!(
-                        "Block at height {} has invalid parent hash",
-                        expected_height
-                    ));
-                }
-
-                // Validate timestamp progression - block timestamp must be >= parent timestamp
-                if block.timestamp() < parent_block.timestamp() {
-                    return Err(anyhow!(
-                        "Block at height {} has timestamp before parent block (block: {:?}, parent: {:?})",
-                        expected_height,
-                        block.timestamp(),
-                        parent_block.timestamp()
-                    ));
-                }
-
-                // Validate timestamp is not too far in the future
-                let now = std::time::SystemTime::now();
-                let future_threshold = now + std::time::Duration::from_secs(3600); // 1 hour tolerance
-                if block.timestamp() > future_threshold {
-                    return Err(anyhow!(
-                        "Block at height {} has timestamp too far in the future",
-                        expected_height
-                    ));
-                }
-            }
-
-            // Validate block hash
-            let computed_hash = (|| -> Result<openssl::hash::DigestBytes> {
-                let mut hashing_bytes = block.header_bytes();
-                hashing_bytes.extend_from_slice(&block.block_data());
-                Ok(openssl::hash::hash(
-                    MessageDigest::sha512(),
-                    &hashing_bytes,
-                )?)
-            })()?;
-            if computed_hash.as_ref() != block.block_hash() {
-                return Err(anyhow!(
-                    "Block at height {} has invalid hash",
-                    expected_height
-                ));
-            }
-
-            // Validate signature if present
-            match self.get_signature_by_height(expected_height) {
-                Ok(signature) => {
-                    if signature.is_empty() {
-                        return Err(anyhow!(
-                            "Block at height {} has empty signature",
-                            expected_height
-                        ));
-                    }
-                    // Note: Actual cryptographic signature verification requires
-                    // application-specific public key. Here we only verify presence.
-                    // Applications should provide their own signature verification
-                    // using the stored signature and their public key infrastructure.
-                }
-                Err(_) => {
-                    // Signature is optional - no error if not present
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Validate only blocks added since last validation (incremental)
-    ///
-    /// Uses a validation cache to track the last validated height.
-    /// Only validates blocks from (last_validated_height + 1) to current tip.
-    /// Much faster than `validate_full()` for chains that grow over time.
-    ///
-    /// Returns the height up to which validation succeeded.
-    pub fn validate_incremental(&self) -> Result<u64> {
-        let block_count = self.block_count()?;
-        if block_count == 0 {
-            return Ok(0); // Empty chain, nothing to validate
-        }
-
-        // Get last validated height from cache
-        let validation_cache_cf = self
-            .mode
-            .db
-            .cf_handle("validation_cache")
-            .ok_or_else(|| anyhow!("Failed to get validation_cache column family"))?;
-
-        let last_validated = self
-            .mode
-            .db
-            .get_cf(validation_cache_cf, b"last_validated_height")
-            .map_err(|e| anyhow!("Failed to read validation cache: {}", e))?
-            .and_then(|bytes| {
-                if bytes.len() == 8 {
-                    Some(u64::from_le_bytes(bytes.try_into().ok()?))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0);
-
-        // If already fully validated, nothing to do
-        if last_validated >= block_count - 1 {
-            return Ok(last_validated);
-        }
-
-        // Validate from (last_validated + 1) to (block_count - 1)
-        let start_height = if last_validated == 0 {
-            0
-        } else {
-            last_validated + 1
-        };
-
-        for i in start_height..block_count {
-            let block = self.get_block_by_height(i).map_err(|e| {
-                anyhow!(
-                    "Height gap detected: block at height {} is missing or corrupted: {}",
-                    i,
-                    e
-                )
-            })?;
-
-            let expected_height = i;
-            if block.height() != expected_height {
-                return Err(anyhow!(
-                    "Block height mismatch at index {}: expected {}, got {}",
-                    i,
-                    expected_height,
-                    block.height()
-                ));
-            }
-
-            // Validate genesis block
-            if expected_height == 0 {
-                if block.parent_hash() != [0u8; BLOCK_HASH_SIZE] {
-                    return Err(anyhow!("Genesis block has non-zero parent hash"));
-                }
-                let now = std::time::SystemTime::now();
-                let future_threshold = now + std::time::Duration::from_secs(3600);
-                if block.timestamp() > future_threshold {
-                    return Err(anyhow!("Genesis block timestamp is too far in the future"));
-                }
-            } else {
-                // Validate parent linkage
-                let parent_block = self.get_block_by_height(expected_height - 1)?;
-                if block.parent_hash() != parent_block.block_hash() {
-                    return Err(anyhow!(
-                        "Block at height {} has invalid parent hash",
-                        expected_height
-                    ));
-                }
-
-                // Validate timestamp progression
-                if block.timestamp() < parent_block.timestamp() {
-                    return Err(anyhow!(
-                        "Block at height {} has timestamp before parent block (block: {:?}, parent: {:?})",
-                        expected_height,
-                        block.timestamp(),
-                        parent_block.timestamp()
-                    ));
-                }
-
-                let now = std::time::SystemTime::now();
-                let future_threshold = now + std::time::Duration::from_secs(3600);
-                if block.timestamp() > future_threshold {
-                    return Err(anyhow!(
-                        "Block at height {} has timestamp too far in the future",
-                        expected_height
-                    ));
-                }
-            }
-
-            // Validate block hash
-            let computed_hash = (|| -> Result<openssl::hash::DigestBytes> {
-                let mut hashing_bytes = block.header_bytes();
-                hashing_bytes.extend_from_slice(&block.block_data());
-                Ok(openssl::hash::hash(
-                    MessageDigest::sha512(),
-                    &hashing_bytes,
-                )?)
-            })()?;
-            if computed_hash.as_ref() != block.block_hash() {
-                return Err(anyhow!(
-                    "Block at height {} has invalid hash",
-                    expected_height
-                ));
-            }
-
-            // Validate signature if present
-            let signatures_cf = self
-                .mode
-                .db
-                .cf_handle("signatures")
-                .ok_or_else(|| anyhow!("Failed to get signatures column family"))?;
-
-            match self
-                .mode
-                .db
-                .get_cf(signatures_cf, expected_height.to_le_bytes())
-                .map_err(|e| anyhow!("Failed to get signature by height: {}", e))?
-            {
-                Some(signature) => {
-                    if signature.is_empty() {
-                        return Err(anyhow!(
-                            "Block at height {} has empty signature",
-                            expected_height
-                        ));
-                    }
-                }
-                None => {
-                    // Signature is optional
-                }
-            }
-        }
-
-        // Update validation cache with new height (read-only can't write, so skip)
-        // Note: This is read-only mode, cache update happens in ReadWrite mode
-        Ok(block_count - 1)
-    }
-
-    /// Convenience method that calls validate_incremental()
-    ///
-    /// For backward compatibility. Use `validate_full()` for complete validation
-    /// or `validate_incremental()` for faster incremental validation.
-    pub fn validate(&self) -> Result<()> {
-        self.validate_incremental()?;
-        Ok(())
     }
 }
 
@@ -410,7 +435,7 @@ impl BlockChain<ReadWrite> {
             mode: ReadWrite { db },
         })
     }
-    pub fn put_block(&self, block_data: Vec<u8>) -> Result<u64> {
+    pub fn put_block(&self, block_data: Vec<u8>, signature: Vec<u8>) -> Result<u64> {
         // Check block size limit
         if block_data.len() > MAX_BLOCK_SIZE {
             return Err(anyhow!(
@@ -425,7 +450,16 @@ impl BlockChain<ReadWrite> {
             Block::new_genesis_block(block_data)?
         } else {
             // Get the previous block which is 1 less than block count
-            let parent_block = self.get_block_by_height(block_count - 1)?;
+            let parent_block = match self.get_block_by_height(block_count - 1) {
+                (Ok(block), Ok(_)) => block,
+                (Err(e), _) | (_, Err(e)) => {
+                    return Err(anyhow!(
+                        "Failed to retrieve parent block at height {}: {}",
+                        block_count - 1,
+                        e
+                    ));
+                }
+            };
             let parent_hash = parent_block.block_hash();
             Block::new_regular_block(block_count, parent_hash, block_data)?
         };
@@ -465,7 +499,15 @@ impl BlockChain<ReadWrite> {
                 validated_height.to_le_bytes(),
             )
             .map_err(|e| anyhow!("Failed to update validation cache: {}", e))?;
-
+        let signatures_cf = self
+            .mode
+            .db
+            .cf_handle("signatures")
+            .ok_or_else(|| anyhow!("Failed to get signatures column family"))?;
+        self.mode
+            .db
+            .put_cf(signatures_cf, height.to_le_bytes(), &signature)
+            .map_err(|e| anyhow!("Failed to insert signature: {}", e))?;
         Ok(block.height())
     }
 
@@ -513,295 +555,6 @@ impl BlockChain<ReadWrite> {
                 Ok(Some(block_count - 1))
             }
         }
-    }
-
-    /// Validate the entire blockchain from genesis to tip
-    ///
-    /// Performs full validation checking:
-    /// - Parent hash chain integrity
-    /// - Block hash correctness
-    /// - Height gaps
-    /// - Timestamp consistency
-    /// - Signature presence (if stored)
-    ///
-    /// This is an expensive O(n) operation. Consider using `validate_incremental()` instead.
-    pub fn validate_full(&self) -> Result<()> {
-        let block_count = self.block_count()?;
-        if block_count == 0 {
-            return Ok(()); // Empty chain is valid
-        }
-
-        // Check for height gaps by attempting to retrieve all blocks sequentially
-        for i in 0..block_count {
-            let block = self.get_block_by_height(i).map_err(|e| {
-                anyhow!(
-                    "Height gap detected: block at height {} is missing or corrupted: {}",
-                    i,
-                    e
-                )
-            })?;
-
-            let expected_height = i;
-            if block.height() != expected_height {
-                return Err(anyhow!(
-                    "Block height mismatch at index {}: expected {}, got {}",
-                    i,
-                    expected_height,
-                    block.height()
-                ));
-            }
-
-            // Validate genesis block
-            if expected_height == 0 {
-                if block.parent_hash() != [0u8; BLOCK_HASH_SIZE] {
-                    return Err(anyhow!("Genesis block has non-zero parent hash"));
-                }
-                // Genesis block timestamp should be reasonable (not in far future)
-                let now = std::time::SystemTime::now();
-                let future_threshold = now + std::time::Duration::from_secs(3600); // 1 hour tolerance
-                if block.timestamp() > future_threshold {
-                    return Err(anyhow!("Genesis block timestamp is too far in the future"));
-                }
-            } else {
-                // Validate parent linkage
-                let parent_block = self.get_block_by_height(expected_height - 1)?;
-                if block.parent_hash() != parent_block.block_hash() {
-                    return Err(anyhow!(
-                        "Block at height {} has invalid parent hash",
-                        expected_height
-                    ));
-                }
-
-                // Validate timestamp progression - block timestamp must be >= parent timestamp
-                if block.timestamp() < parent_block.timestamp() {
-                    return Err(anyhow!(
-                        "Block at height {} has timestamp before parent block (block: {:?}, parent: {:?})",
-                        expected_height,
-                        block.timestamp(),
-                        parent_block.timestamp()
-                    ));
-                }
-
-                // Validate timestamp is not too far in the future
-                let now = std::time::SystemTime::now();
-                let future_threshold = now + std::time::Duration::from_secs(3600); // 1 hour tolerance
-                if block.timestamp() > future_threshold {
-                    return Err(anyhow!(
-                        "Block at height {} has timestamp too far in the future",
-                        expected_height
-                    ));
-                }
-            }
-
-            // Validate block hash
-            let computed_hash = (|| -> Result<openssl::hash::DigestBytes> {
-                let mut hashing_bytes = block.header_bytes();
-                hashing_bytes.extend_from_slice(&block.block_data());
-                Ok(openssl::hash::hash(
-                    MessageDigest::sha512(),
-                    &hashing_bytes,
-                )?)
-            })()?;
-            if computed_hash.as_ref() != block.block_hash() {
-                return Err(anyhow!(
-                    "Block at height {} has invalid hash",
-                    expected_height
-                ));
-            }
-
-            // Validate signature if present
-            let signatures_cf = self
-                .mode
-                .db
-                .cf_handle("signatures")
-                .ok_or_else(|| anyhow!("Failed to get signatures column family"))?;
-
-            match self
-                .mode
-                .db
-                .get_cf(signatures_cf, expected_height.to_le_bytes())
-                .map_err(|e| anyhow!("Failed to get signature by height: {}", e))?
-            {
-                Some(signature) => {
-                    if signature.is_empty() {
-                        return Err(anyhow!(
-                            "Block at height {} has empty signature",
-                            expected_height
-                        ));
-                    }
-                    // Note: Actual cryptographic signature verification requires
-                    // application-specific public key. Here we only verify presence.
-                    // Applications should provide their own signature verification
-                    // using the stored signature and their public key infrastructure.
-                }
-                None => {
-                    // Signature is optional - no error if not present
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Validate only blocks added since last validation (incremental)
-    ///
-    /// Uses a validation cache to track the last validated height.
-    /// Only validates blocks from (last_validated_height + 1) to current tip.
-    /// Much faster than `validate_full()` for chains that grow over time.
-    /// Updates the validation cache after successful validation.
-    ///
-    /// Returns the height up to which validation succeeded.
-    pub fn validate_incremental(&self) -> Result<u64> {
-        let block_count = self.block_count()?;
-        if block_count == 0 {
-            return Ok(0); // Empty chain, nothing to validate
-        }
-
-        // Get last validated height from cache
-        let validation_cache_cf = self
-            .mode
-            .db
-            .cf_handle("validation_cache")
-            .ok_or_else(|| anyhow!("Failed to get validation_cache column family"))?;
-
-        let last_validated = self
-            .mode
-            .db
-            .get_cf(validation_cache_cf, b"last_validated_height")
-            .map_err(|e| anyhow!("Failed to read validation cache: {}", e))?
-            .and_then(|bytes| {
-                if bytes.len() == 8 {
-                    Some(u64::from_le_bytes(bytes.try_into().ok()?))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0);
-
-        // If already fully validated, nothing to do
-        if last_validated >= block_count - 1 {
-            return Ok(last_validated);
-        }
-
-        // Validate from (last_validated + 1) to (block_count - 1)
-        let start_height = if last_validated == 0 {
-            0
-        } else {
-            last_validated + 1
-        };
-
-        for i in start_height..block_count {
-            let block = self.get_block_by_height(i).map_err(|e| {
-                anyhow!(
-                    "Height gap detected: block at height {} is missing or corrupted: {}",
-                    i,
-                    e
-                )
-            })?;
-
-            let expected_height = i;
-            if block.height() != expected_height {
-                return Err(anyhow!(
-                    "Block height mismatch at index {}: expected {}, got {}",
-                    i,
-                    expected_height,
-                    block.height()
-                ));
-            }
-
-            // Validate genesis block
-            if expected_height == 0 {
-                if block.parent_hash() != [0u8; BLOCK_HASH_SIZE] {
-                    return Err(anyhow!("Genesis block has non-zero parent hash"));
-                }
-                let now = std::time::SystemTime::now();
-                let future_threshold = now + std::time::Duration::from_secs(3600);
-                if block.timestamp() > future_threshold {
-                    return Err(anyhow!("Genesis block timestamp is too far in the future"));
-                }
-            } else {
-                // Validate parent linkage
-                let parent_block = self.get_block_by_height(expected_height - 1)?;
-                if block.parent_hash() != parent_block.block_hash() {
-                    return Err(anyhow!(
-                        "Block at height {} has invalid parent hash",
-                        expected_height
-                    ));
-                }
-
-                // Validate timestamp progression
-                if block.timestamp() < parent_block.timestamp() {
-                    return Err(anyhow!(
-                        "Block at height {} has timestamp before parent block (block: {:?}, parent: {:?})",
-                        expected_height,
-                        block.timestamp(),
-                        parent_block.timestamp()
-                    ));
-                }
-
-                let now = std::time::SystemTime::now();
-                let future_threshold = now + std::time::Duration::from_secs(3600);
-                if block.timestamp() > future_threshold {
-                    return Err(anyhow!(
-                        "Block at height {} has timestamp too far in the future",
-                        expected_height
-                    ));
-                }
-            }
-
-            // Validate block hash
-            let computed_hash = (|| -> Result<openssl::hash::DigestBytes> {
-                let mut hashing_bytes = block.header_bytes();
-                hashing_bytes.extend_from_slice(&block.block_data());
-                Ok(openssl::hash::hash(
-                    MessageDigest::sha512(),
-                    &hashing_bytes,
-                )?)
-            })()?;
-            if computed_hash.as_ref() != block.block_hash() {
-                return Err(anyhow!(
-                    "Block at height {} has invalid hash",
-                    expected_height
-                ));
-            }
-
-            // Validate signature if present
-            let signatures_cf = self
-                .mode
-                .db
-                .cf_handle("signatures")
-                .ok_or_else(|| anyhow!("Failed to get signatures column family"))?;
-
-            match self
-                .mode
-                .db
-                .get_cf(signatures_cf, expected_height.to_le_bytes())
-                .map_err(|e| anyhow!("Failed to get signature by height: {}", e))?
-            {
-                Some(signature) => {
-                    if signature.is_empty() {
-                        return Err(anyhow!(
-                            "Block at height {} has empty signature",
-                            expected_height
-                        ));
-                    }
-                }
-                None => {
-                    // Signature is optional
-                }
-            }
-        }
-
-        // Successfully validated up to block_count - 1
-        Ok(block_count - 1)
-    }
-
-    /// Convenience method that calls validate_incremental()
-    ///
-    /// For backward compatibility. Use `validate_full()` for complete validation
-    /// or `validate_incremental()` for faster incremental validation.
-    pub fn validate(&self) -> Result<()> {
-        self.validate_incremental()?;
-        Ok(())
     }
 }
 

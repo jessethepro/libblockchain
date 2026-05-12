@@ -30,7 +30,7 @@ impl BlockChain {
     pub fn open(db_path: &str) -> Result<Self> {
         let db = RocksDbModel::new(db_path)
             .with_column_family("blocks")
-            .with_column_family("signatures")
+            .with_column_family("meta_data")
             .with_column_family("validation_cache")
             .open_multi_threaded()
             .map_err(|e| anyhow!("Failed to open RocksDB in read-write mode: {}", e))?;
@@ -43,10 +43,10 @@ impl BlockChain {
             .ok_or_else(|| anyhow!("Failed to get blocks column family"))
     }
 
-    fn signatures_cf(&self) -> Result<Arc<BoundColumnFamily<'_>>> {
+    fn meta_data_cf(&self) -> Result<Arc<BoundColumnFamily<'_>>> {
         self.db
-            .cf_handle("signatures")
-            .ok_or_else(|| anyhow!("Failed to get signatures column family"))
+            .cf_handle("meta_data")
+            .ok_or_else(|| anyhow!("Failed to get meta_data column family"))
     }
 
     fn validation_cache_cf(&self) -> Result<Arc<BoundColumnFamily<'_>>> {
@@ -90,28 +90,19 @@ impl BlockChain {
             Block::from_bytes(&block_bytes)
         })();
 
-        let signature = (|| -> Result<Vec<u8>> {
-            let signatures_cf = self.signatures_cf()?;
+        let meta_data = (|| -> Result<Vec<u8>> {
+            let meta_data_cf = self.meta_data_cf()?;
             match self
                 .db
-                .get_cf(&signatures_cf, height.to_le_bytes())
-                .map_err(|e| anyhow!("Failed to get signature by height: {}", e))?
+                .get_cf(&meta_data_cf, height.to_le_bytes())
+                .map_err(|e| anyhow!("Failed to get metadata by height: {}", e))?
             {
-                Some(sig) => Ok(sig),
+                Some(data) => Ok(data),
                 None => Ok(vec![]),
             }
         })();
 
-        (block, signature)
-    }
-
-    /// Retrieve only the signature stored for `height`.
-    pub fn get_signature_by_height(&self, height: u64) -> Result<Vec<u8>> {
-        let signatures_cf = self.signatures_cf()?;
-        self.db
-            .get_cf(&signatures_cf, height.to_le_bytes())
-            .map_err(|e| anyhow!("Failed to get signature by height: {}", e))?
-            .ok_or_else(|| anyhow!("No signature found at height {}", height))
+        (block, meta_data)
     }
 
     /// Validate the entire blockchain from genesis to tip.
@@ -130,8 +121,8 @@ impl BlockChain {
         }
 
         for height in 0..block_count {
-            let (block, signature) = match self.get_block_by_height(height) {
-                (Ok(block), Ok(signature)) => (block, signature),
+            let (block, meta_data) = match self.get_block_by_height(height) {
+                (Ok(block), Ok(meta_data)) => (block, meta_data),
                 (Err(e), _) | (_, Err(e)) => {
                     return Err(anyhow!(
                         "Height gap detected: block at height {} is missing or corrupted: {}",
@@ -203,8 +194,8 @@ impl BlockChain {
                 return Err(anyhow!("Block at height {} has invalid hash", height));
             }
 
-            if signature.is_empty() {
-                return Err(anyhow!("Block at height {} has empty signature", height));
+            if meta_data.is_empty() {
+                return Err(anyhow!("Block at height {} has empty metadata", height));
             }
         }
 
@@ -334,12 +325,12 @@ impl BlockChain {
         Ok(())
     }
 
-    /// Append a block and its signature to the chain.
+    /// Append a block and its metadata to the chain.
     ///
     /// Heights are assigned automatically. The new block is written together with its
-    /// signature, flushed, then validated incrementally. On success, the new height is
+    /// metadata, flushed, then validated incrementally. On success, the new height is
     /// returned.
-    pub fn put_block(&self, block_data: Vec<u8>, signature: Vec<u8>) -> Result<u64> {
+    pub fn put_block(&self, block_data: &Vec<u8>, meta_data: &Vec<u8>) -> Result<u64> {
         if block_data.len() > MAX_BLOCK_SIZE {
             return Err(anyhow!(
                 "Block data exceeds maximum size: {} bytes (max: {} bytes)",
@@ -362,7 +353,7 @@ impl BlockChain {
                     ));
                 }
             };
-            Block::new_regular_block(block_count, parent_block.block_hash(), block_data)?
+            Block::new_regular_block(block_count, &parent_block.block_hash(), block_data)?
         };
 
         let height = block.height();
@@ -371,10 +362,10 @@ impl BlockChain {
             .put_cf(&blocks_cf, height.to_le_bytes(), block.bytes())
             .map_err(|e| anyhow!("Failed to insert block: {}", e))?;
 
-        let signatures_cf = self.signatures_cf()?;
+        let meta_data_cf = self.meta_data_cf()?;
         self.db
-            .put_cf(&signatures_cf, height.to_le_bytes(), &signature)
-            .map_err(|e| anyhow!("Failed to insert signature: {}", e))?;
+            .put_cf(&meta_data_cf, height.to_le_bytes(), meta_data)
+            .map_err(|e| anyhow!("Failed to insert metadata: {}", e))?;
 
         self.db
             .flush()
@@ -393,16 +384,7 @@ impl BlockChain {
         Ok(height)
     }
 
-    /// Store or replace the signature for an existing block height.
-    pub fn put_signature(&self, height: u64, signature: Vec<u8>) -> Result<u64> {
-        let signatures_cf = self.signatures_cf()?;
-        self.db
-            .put_cf(&signatures_cf, height.to_le_bytes(), &signature)
-            .map_err(|e| anyhow!("Failed to insert signature: {}", e))?;
-        Ok(height)
-    }
-
-    /// Delete the most recently appended block and its signature.
+    /// Delete the most recently appended block and its metadata.
     ///
     /// Returns `Ok(None)` if the chain is empty.
     pub fn delete_last_block(&self) -> Result<Option<u64>> {
@@ -417,10 +399,10 @@ impl BlockChain {
             .delete_cf(&blocks_cf, height.to_le_bytes())
             .map_err(|e| anyhow!("Failed to delete block: {}", e))?;
 
-        let signatures_cf = self.signatures_cf()?;
+        let meta_data_cf = self.meta_data_cf()?;
         self.db
-            .delete_cf(&signatures_cf, height.to_le_bytes())
-            .map_err(|e| anyhow!("Failed to delete signature: {}", e))?;
+            .delete_cf(&meta_data_cf, height.to_le_bytes())
+            .map_err(|e| anyhow!("Failed to delete metadata: {}", e))?;
 
         Ok(Some(height))
     }

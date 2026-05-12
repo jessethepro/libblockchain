@@ -51,7 +51,7 @@ pub struct BlockHeader {
 }
 
 impl BlockHeader {
-    pub fn new(parent_hash: Vec<u8>, height: u64) -> Result<Self> {
+    pub fn new(parent_hash: &Vec<u8>, height: u64) -> Result<Self> {
         use uuid::Uuid;
         if parent_hash.len() != BLOCK_HASH_SIZE {
             return Err(anyhow!(
@@ -196,8 +196,8 @@ impl Block {
     /// * `block_data` - Application-specific payload bytes
     pub fn new_regular_block(
         height: u64,
-        parent_hash: Vec<u8>,
-        block_data: Vec<u8>,
+        parent_hash: &Vec<u8>,
+        block_data: &Vec<u8>,
     ) -> Result<Self> {
         let block_header = BlockHeader::new(parent_hash, height)?;
         let mut hashing_data = block_header.bytes();
@@ -214,13 +214,13 @@ impl Block {
         Ok(Self {
             block_header,
             block_hash,
-            block_data,
+            block_data: block_data.clone(),
         })
     }
 
-    pub fn new_genesis_block(block_data: Vec<u8>) -> Result<Self> {
+    pub fn new_genesis_block(block_data: &Vec<u8>) -> Result<Self> {
         // Genesis block has height 0 and parent hash of all zeros.
-        Self::new_regular_block(0, vec![0u8; 64], block_data)
+        Self::new_regular_block(0, &vec![0u8; 64], block_data)
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
